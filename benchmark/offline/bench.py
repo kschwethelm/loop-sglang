@@ -1,13 +1,20 @@
 # Adapted from: https://github.com/GeeeekExplorer/nano-vllm/blob/main/bench.py
 
+import argparse
 import time
 from random import randint, seed
 
-from minisgl.core import SamplingParams
-from minisgl.llm import LLM
+from loopsgl.core import SamplingParams
+from loopsgl.llm import LLM
 
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Benchmark offline generation.")
+    parser.add_argument("--model", default="KristianS7/Ouro-1.4B", help="Model ID or local path.")
+    parser.add_argument(
+        "--loop-cache-policy", choices=("depth_indexed", "shared"), default="depth_indexed"
+    )
+    args = parser.parse_args()
     seed(0)
     num_seqs = 256
     max_input_len = 1024
@@ -15,7 +22,8 @@ def main():
 
     # align the hyperparameters
     llm = LLM(
-        "Qwen/Qwen3-0.6B",
+        args.model,
+        loop_cache_policy=args.loop_cache_policy,
         max_seq_len_override=4096,
         max_extend_tokens=16384,
         cuda_graph_max_bs=256,

@@ -11,6 +11,7 @@ repos:
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
+        exclude: ^uv\.lock$
       - id: check-merge-conflict
       - id: detect-private-key
       - id: debug-statements
@@ -35,5 +36,5 @@ repos:
         args: [--style=file, --verbose]
         exclude: |
           (?x)^(
-            python/minisgl/kernel/csrc/include/minisgl/nccl227.h
+            python/loopsgl/kernel/csrc/include/loopsgl/nccl227.h
           )

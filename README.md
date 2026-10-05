@@ -1,12 +1,11 @@
-# CDB-SGLang
+# Loop-SGLang
 
-**Continuous depth batching for depth-adaptive looped language models.**
+**Lightweight serving engine for looped LMs built on Mini-SGLang.**
 
 > [!WARNING]
 > **Work in progress.**
-> This repository currently contains the Mini-SGLang baseline.
-> Depth-adaptive looped model support and continuous depth batching are under development and are not yet implemented here.
-> The usage examples below describe the inherited baseline.
+> Full-depth continuous batching for Ouro and Huginn is implemented.
+> Depth-adaptive inference and continuous depth batching remain under development.
 
 ## Project Scope
 
@@ -14,10 +13,17 @@ Looped language models reuse a recurrent core across multiple loop steps.
 Depth-adaptive inference lets each token exit that core after a different number of steps, allocating compute according to the token's needs.
 Continuous depth batching (CDB) forms new batches between loop steps, removing exited tokens and optionally refilling freed slots with new tokens to keep GPU execution efficient.
 
-CDB-SGLang aims to bring this scheduling approach into a lightweight serving engine built on Mini-SGLang.
-The planned scope includes stage-wise scheduling, depth-aware KV caching, and asynchronous execution for depth-adaptive looped models.
+Loop-SGLang aims to bring this scheduling approach into a lightweight serving engine built on Mini-SGLang.
+The next steps include scheduling between loop steps and early exit for depth-adaptive looped models.
 
 For the research implementation and experimental results, see [Continuous Depth Batching for Looped Language Models](https://github.com/LoopedLMs/looped-lm-continuous-batching) and the paper, [Depth-adaptive Inference of Looped Language Models via Continuous Depth Batching](https://arxiv.org/abs/2608.09444).
+
+## Progress
+
+- Full-depth CB support for [Ouro](https://huggingface.co/KristianS7/Ouro-1.4B) and [Huginn](https://huggingface.co/KristianS7/huginn-0125).
+  Use our linked model forks for compatibility with Loop-SGLang.
+- Depth-indexed and shared looped LM KV caching (note: shared caching changes model behavior)
+- Generation-based accuracy evaluation with lm-eval
 
 ## Attribution
 
@@ -55,12 +61,12 @@ source .venv/bin/activate
 
 ### 2. Installation
 
-Install CDB-SGLang directly from source.
-The Python package and CLI currently retain the `minisgl` name.
+Install Loop-SGLang directly from source.
+The Python package is `loopsgl`, and the CLI runs with `python -m loopsgl`.
 
 ```bash
-git clone https://github.com/kschwethelm/cdb-sglang.git
-cd cdb-sglang && uv venv --python=3.12 && source .venv/bin/activate
+git clone https://github.com/kschwethelm/loop-sglang.git
+cd loop-sglang && uv venv --python=3.12 && source .venv/bin/activate
 uv pip install -e .
 ```
 
@@ -79,11 +85,11 @@ Since Mini-SGLang requires Linux-specific dependencies, Windows users should use
    - Follow [NVIDIA's WSL2 CUDA guide](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
    - Ensure your Windows GPU drivers support WSL2
 
-3. **Install CDB-SGLang in WSL2**:
+3. **Install Loop-SGLang in WSL2**:
    ```bash
    # Inside WSL2 terminal
-   git clone https://github.com/kschwethelm/cdb-sglang.git
-   cd cdb-sglang && uv venv --python=3.12 && source .venv/bin/activate
+   git clone https://github.com/kschwethelm/loop-sglang.git
+   cd loop-sglang && uv venv --python=3.12 && source .venv/bin/activate
    uv pip install -e .
    ```
 
@@ -100,19 +106,19 @@ Since Mini-SGLang requires Linux-specific dependencies, Windows users should use
 
 1. **Build the Docker image**:
    ```bash
-   docker build -t minisgl .
+   docker build -t loopsgl .
    ```
 
 2. **Run the server**:
    ```bash
    docker run --gpus all -p 1919:1919 \
-       minisgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
+       loopsgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
    ```
 
 3. **Run in interactive shell mode**:
    ```bash
    docker run -it --gpus all \
-       minisgl --model Qwen/Qwen3-0.6B --shell
+       loopsgl --model Qwen/Qwen3-0.6B --shell
    ```
 
 4. **Using Docker Volumes for persistent caches** (recommended for faster subsequent startups):
@@ -121,7 +127,7 @@ Since Mini-SGLang requires Linux-specific dependencies, Windows users should use
        -v huggingface_cache:/app/.cache/huggingface \
        -v tvm_cache:/app/.cache/tvm-ffi \
        -v flashinfer_cache:/app/.cache/flashinfer \
-       minisgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
+       loopsgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
    ```
 
 </details>
@@ -131,11 +137,12 @@ Since Mini-SGLang requires Linux-specific dependencies, Windows users should use
 Launch an OpenAI-compatible API server with a single command.
 
 ```bash
-# Deploy Qwen/Qwen3-0.6B on a single GPU
-python -m minisgl --model "Qwen/Qwen3-0.6B"
+# Deploy Ouro or Huginn with the default depth-indexed loop cache
+python -m loopsgl --model "KristianS7/Ouro-1.4B"
+python -m loopsgl --model "KristianS7/huginn-0125"
 
 # Deploy meta-llama/Llama-3.1-70B-Instruct on 4 GPUs with Tensor Parallelism, on port 30000
-python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 30000
+python -m loopsgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 30000
 ```
 
 Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
@@ -145,22 +152,33 @@ Once the server is running, you can send requests using standard tools like `cur
 Chat with your model directly in the terminal by adding the `--shell` flag.
 
 ```bash
-python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
+python -m loopsgl --model "Qwen/Qwen3-0.6B" --shell
 ```
 
 ![shell-example](https://lmsys.org/images/blog/minisgl/shell.png)
 
 You can also use `/reset` to clear the chat history.
 
+### 5. Accuracy Evaluation
+
+Install the optional `eval` dependencies and run generation tasks such as GSM8K through the offline engine.
+Log-likelihood and perplexity evaluation are not yet supported.
+
+```bash
+uv run --extra eval python -m loopsgl.evaluation run --model loopsgl \
+    --model_args pretrained=KristianS7/Ouro-1.4B,loop_cache_policy=depth_indexed,max_gen_toks=256 \
+    --tasks gsm8k_cot --num_fewshot 3 --batch_size auto
+```
+
 ## Upstream Baseline Benchmarks
 
 These benchmark results are inherited from Mini-SGLang.
-They have not been reproduced for CDB-SGLang and do not evaluate depth-adaptive looped models.
+They have not been reproduced for Loop-SGLang and do not evaluate depth-adaptive looped models.
 
 ### Offline inference
 
 See [bench.py](./benchmark/offline/bench.py) for more details.
-Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for ablation study on overlap scheduling.
+Set `LOOPSGL_DISABLE_OVERLAP_SCHEDULING=1` for ablation study on overlap scheduling.
 
 Test Configuration:
 
@@ -185,8 +203,8 @@ Test Configuration:
 Launch command:
 
 ```bash
-# Mini-SGLang
-python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --cache naive
+# Loop-SGLang
+python -m loopsgl --model "Qwen/Qwen3-32B" --tp 4 --cache naive
 
 # SGLang
 python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
@@ -195,7 +213,7 @@ python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
 
 > **Note**: If you encounter network issues when downloading models from HuggingFace, try using `--model-source modelscope` to download from ModelScope instead:
 > ```bash
-> python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --model-source modelscope
+> python -m loopsgl --model "Qwen/Qwen3-32B" --tp 4 --model-source modelscope
 > ```
 
 ![online](https://lmsys.org/images/blog/minisgl/online.png)

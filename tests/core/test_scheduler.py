@@ -4,11 +4,11 @@ import torch
 import multiprocessing as mp
 from transformers import AutoTokenizer
 
-from minisgl.distributed import DistributedInfo
-from minisgl.message import BaseBackendMsg, BaseTokenizerMsg, DetokenizeMsg, ExitMsg, UserMsg
-from minisgl.scheduler import Scheduler, SchedulerConfig
-from minisgl.utils import ZmqPullQueue, ZmqPushQueue, call_if_main, init_logger
-from minisgl.core import SamplingParams
+from loopsgl.distributed import DistributedInfo
+from loopsgl.message import BaseBackendMsg, BaseTokenizerMsg, DetokenizeMsg, ExitMsg, UserMsg
+from loopsgl.scheduler import Scheduler, SchedulerConfig
+from loopsgl.utils import ZmqPullQueue, ZmqPushQueue, call_if_main, init_logger
+from loopsgl.core import SamplingParams
 
 logger = init_logger(__name__)
 

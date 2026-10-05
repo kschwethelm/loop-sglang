@@ -1,0 +1,29 @@
+# Copy to _machine_config.sh and fill in this machine's paths and SLURM settings.
+# Concrete machine configurations are ignored by Git.
+# REPO_ROOT is supplied by _submit.sh and can be overridden by the caller.
+
+# Machine-specific paths and SLURM identity are fixed by this configuration.
+export BASE_DIR=""
+export DATA_ROOT=""
+export CUDA_ENV_SCRIPT=""
+export HF_HOME=""
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export UV_CACHE_DIR=""
+
+export SLURM_PARTITION_GPU=""
+export SLURM_QOS_GPU=""
+export SLURM_ACCOUNT=""
+
+# Job resource defaults can be overridden by the environment.
+export NUM_GPUS="${NUM_GPUS:-1}"
+export SLURM_GPU_TYPE="${SLURM_GPU_TYPE-}"
+export SLURM_GPU_MEM="${SLURM_GPU_MEM-}"
+export SLURM_MEM_GPU="${SLURM_MEM_GPU:-64G}"
+# Leave empty to use the cluster's default CPU allocation.
+export SLURM_CPUS_GPU="${SLURM_CPUS_GPU-16}"
+export SLURM_TIME="${SLURM_TIME:-08:00:00}"
+export SLURM_MAIL_USER="${SLURM_MAIL_USER-}"
+
+# _submit.sh validates and applies this full GPU UUID inside the allocated batch job.
+# Leave empty to use all GPUs allocated by SLURM
+export PIN_H100_UUID="${PIN_H100_UUID-}"

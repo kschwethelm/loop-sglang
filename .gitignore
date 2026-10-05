@@ -35,3 +35,13 @@ env/
 # Local agent instructions and experiment outputs
 /AGENTS.md
 /outputs/
+
+# Local paper checkout
+/docs/paper
+
+# Private machine configurations
+/shells/_machine_config.sh
+/shells/_machine_config_*.sh
+
+# SLURM logs
+/logs/
