@@ -4,11 +4,10 @@ Test that CacheManager._allocate correctly handles eviction with page_size > 1.
 
 from __future__ import annotations
 
+import loopsgl.core as core
 import pytest
 import torch
-
-import minisgl.core as core
-from minisgl.scheduler.cache import CacheManager
+from loopsgl.scheduler.cache import CacheManager
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +54,21 @@ def _assert_no_overlap(pages: torch.Tensor, page_size: int):
         expanded.update(token_range)
 
 
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_padding_page_is_reserved(page_size: int) -> None:
+    """Real pages remain allocatable and reusable while page 0 stays reserved."""
+    cm = _make_cache_manager(num_pages=4, page_size=page_size)
+    assert cm.available_size == 4 * page_size
+    pages = cm._allocate(4)
+    torch.testing.assert_close(pages, torch.arange(1, 5, dtype=torch.int32) * page_size)
+    tokens = cm._page_to_token(pages)
+    assert tokens.min() == page_size
+    assert tokens.max() == 5 * page_size - 1
+    cm._free(tokens)
+    cm.check_integrity()
+    torch.testing.assert_close(cm._allocate(4), pages)
+
+
 class TestAllocateEvictPageAlignment:
     """Tests for _allocate handling eviction with page_size > 1."""
 
@@ -70,8 +84,8 @@ class TestAllocateEvictPageAlignment:
 
         # Insert 2 pages worth of data into the cache (evictable)
         input_ids = torch.arange(page_size * 2, dtype=torch.int32)
-        # Simulate page table entries: page 0 = [0,1,2,3], page 1 = [4,5,6,7]
-        indices = torch.arange(page_size * 2, dtype=torch.int32)
+        # Real page table entries start at page 1.
+        indices = torch.arange(page_size, page_size * 3, dtype=torch.int32)
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 1 page — triggers eviction
@@ -90,7 +104,7 @@ class TestAllocateEvictPageAlignment:
 
         # Insert 2 pages into cache
         input_ids = torch.arange(page_size * 2, dtype=torch.int32)
-        indices = torch.arange(page_size * 2, dtype=torch.int32)
+        indices = torch.arange(page_size, page_size * 3, dtype=torch.int32)
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 2 pages one by one
@@ -113,8 +127,8 @@ class TestAllocateEvictPageAlignment:
         # Insert 4 pages worth of data (4 * 8 = 32 tokens)
         n_tokens = page_size * 4
         input_ids = torch.arange(n_tokens, dtype=torch.int32)
-        # Indices: page starts at 0, 8, 16, 24
-        indices = torch.arange(n_tokens, dtype=torch.int32)
+        # Page 0 stays reserved; cached pages start at 8, 16, 24, 32.
+        indices = torch.arange(page_size, page_size + n_tokens, dtype=torch.int32)
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 1 page — evicts and refills _free_slots
@@ -135,7 +149,7 @@ class TestAllocateEvictPageAlignment:
         # Insert 3 pages into cache
         n_tokens = page_size * 3
         input_ids = torch.arange(n_tokens, dtype=torch.int32)
-        indices = torch.arange(n_tokens, dtype=torch.int32)
+        indices = torch.arange(page_size, page_size + n_tokens, dtype=torch.int32)
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 2 pages at once — needs eviction of at least 2 pages
@@ -152,9 +166,9 @@ class TestAllocateEvictPageAlignment:
 
         cm._allocate(num_pages)
 
-        # Insert 2 pages: tokens [0..7] with indices [0..7]
+        # Insert 2 pages starting after reserved page 0.
         input_ids = torch.arange(page_size * 2, dtype=torch.int32)
-        indices = torch.arange(page_size * 2, dtype=torch.int32)
+        indices = torch.arange(page_size, page_size * 3, dtype=torch.int32)
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 2 pages via eviction

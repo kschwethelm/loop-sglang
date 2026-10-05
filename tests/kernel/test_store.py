@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from minisgl.benchmark.perf import compare_memory_kernel_perf
 import torch
-from minisgl.kernel import store_cache
-from minisgl.utils import call_if_main
+from loopsgl.benchmark.perf import compare_memory_kernel_perf
+from loopsgl.kernel import store_cache
+from loopsgl.utils import call_if_main
 
 
 @call_if_main(__name__)
@@ -18,7 +18,7 @@ def test_store_cache():
 
     for bs in [2**n for n in range(0, 16)]:
         # NOTE: we cannot tolerate duplicate indices in this test
-        indices = torch.randperm(NUM_TOKENS, device="cuda")[:bs].to(torch.int32)
+        indices = (torch.randperm(NUM_TOKENS - 1, device="cuda")[:bs] + 1).to(torch.int32)
         qkv = torch.randn((bs, HEAD_SIZE * 4), device="cuda", dtype=torch.float16)
         k = qkv[:, :HEAD_SIZE]
         v = qkv[:, HEAD_SIZE : HEAD_SIZE * 2]

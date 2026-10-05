@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "minisgl"
+name = "loopsgl"
 version = "0.1.0"
-description = "What is this?"
+description = "Serving looped language models, built on Mini-SGLang."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -27,15 +27,16 @@ dependencies = [
     "modelscope",
     "torch<2.10.0",
     "transformers>=4.56.0,<=4.57.3",
-    "flashinfer-python>=0.5.3",
+    "flashinfer-python==0.6.6",
     "pyzmq",
     "uvicorn",
     "fastapi",
     "prompt_toolkit",
     "openai",
     "apache-tvm-ffi>=0.1.4",
-    "sgl_kernel>=0.3.17.post1",
-    "quack-kernels",
+    "sgl-kernel==0.3.21",
+    "quack-kernels==0.3.2",
+    "nvidia-cutlass-dsl==4.4.1",
 ]
 
 [project.optional-dependencies]
@@ -50,10 +51,14 @@ dev = [
     "matplotlib>=3.10.5",
     "pyarrow",
 ]
+eval = [
+    "lm-eval>=0.4.13,<0.5",
+]
 
 [tool.setuptools]
 include-package-data = true
 package-dir = {"" = "python"}
+license-files = ["LICENSE", "LICENSES/*.txt"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
@@ -111,7 +116,7 @@ python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
     "--strict-config",
-    "--cov=minisgl",
+    "--cov=loopsgl",
     "--cov-report=term-missing",
     "--cov-report=html",
 ]
