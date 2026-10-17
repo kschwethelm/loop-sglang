@@ -5,9 +5,10 @@ def generate_clangd():
     import os
     import subprocess
 
+    from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
+
     from loopsgl.kernel.utils import DEFAULT_INCLUDE
     from loopsgl.utils import init_logger
-    from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
 
     logger = init_logger(__name__)
     logger.info("Generating .clangd file...")

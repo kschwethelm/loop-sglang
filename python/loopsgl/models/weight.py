@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import glob
 import re
-from typing import Dict, Iterator, Tuple
+from typing import TYPE_CHECKING, Dict, Iterator, Tuple
 
 import safetensors
 import torch
+from tqdm import tqdm
+
 from loopsgl.distributed import get_tp_info
 from loopsgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
-from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from .config import ModelConfig
 
 _SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
@@ -72,13 +76,15 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
 
-def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+def load_weight(
+    model_path: str, device: torch.device, *, model_config: ModelConfig | None = None
+) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
     from .config import ModelConfig
 
     model_folder = download_hf_weight(model_path)
-    config = ModelConfig.from_hf(cached_load_hf_config(model_path))
+    config = model_config or ModelConfig.from_hf(cached_load_hf_config(model_path))
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()

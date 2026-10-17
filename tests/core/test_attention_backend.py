@@ -23,6 +23,7 @@ def config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(selector.logger, "info_rank0", lambda message: None)
     return SimpleNamespace(
         attention_backend="auto",
+        loop_cache_policy="depth_indexed",
         page_size=1,
         dtype=torch.bfloat16,
         tp_info=SimpleNamespace(rank=0, size=1),

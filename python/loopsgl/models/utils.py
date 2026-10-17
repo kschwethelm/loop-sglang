@@ -116,10 +116,18 @@ class RopeAttn(BaseOP):
         )
 
     @nvtx_annotate("MHA")
-    def forward(self, x: torch.Tensor, *, cache_layer_id: int | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cache_layer_id: int | None = None,
+        core_metadata_depth: int | torch.Tensor | None = None,
+    ) -> torch.Tensor:
         qkv = self.qkv_proj.forward(x)
         del x
-        o = self.attn.forward(qkv, cache_layer_id=cache_layer_id)
+        o = self.attn.forward(
+            qkv, cache_layer_id=cache_layer_id, core_metadata_depth=core_metadata_depth
+        )
         return self.o_proj.forward(o)
 
 

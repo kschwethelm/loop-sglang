@@ -24,6 +24,15 @@ class BaseKVCachePool(ABC):
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None: ...
 
+    @abstractmethod
+    def cpu_copy_size(self, num_tokens: int) -> int: ...
+
+    @abstractmethod
+    def get_cpu_copy(self, indices: torch.Tensor) -> torch.Tensor: ...
+
+    @abstractmethod
+    def load_cpu_copy(self, cpu_tensors: torch.Tensor, indices: torch.Tensor) -> None: ...
+
     @property
     @abstractmethod
     def device(self) -> torch.device: ...
@@ -35,6 +44,16 @@ class BaseKVCachePool(ABC):
     @property
     @abstractmethod
     def num_layers(self) -> int: ...
+
+
+@dataclass(frozen=True)
+class RetractionBackup:
+    cpu_tensors: torch.Tensor
+    cached_len: int
+
+    @property
+    def nbytes(self) -> int:
+        return self.cpu_tensors.numel() * self.cpu_tensors.element_size()
 
 
 @dataclass(frozen=True)

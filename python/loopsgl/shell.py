@@ -1,4 +1,4 @@
-from .server import launch_server
+from .launch_server import main
 
 if __name__ == "__main__":
-    launch_server(run_shell=True)
+    main(run_shell=True)

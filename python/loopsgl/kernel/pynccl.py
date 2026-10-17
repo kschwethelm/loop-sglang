@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import functools
+from importlib.resources import files
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from loopsgl.env import ENV
@@ -27,7 +29,19 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    ldflags = ["-lnccl"]
+    try:
+        nccl_lib = Path(str(files("nvidia.nccl") / "lib" / "libnccl.so.2"))
+    except ModuleNotFoundError:
+        pass
+    else:
+        if nccl_lib.is_file():
+            ldflags = [
+                str(nccl_lib),
+                f"-Wl,-rpath,{nccl_lib.parent}",
+            ]
+
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=ldflags)
 
 
 @functools.cache

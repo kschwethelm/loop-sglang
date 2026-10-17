@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import functools
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
+
+from loopsgl.env import ENV
 
 if TYPE_CHECKING:
     import torch
+
+_NULL_CONTEXT = nullcontext()
 
 
 @contextmanager
@@ -18,6 +22,15 @@ def torch_dtype(dtype: torch.dtype):
         yield
     finally:
         torch.set_default_dtype(old_dtype)
+
+
+def profile_range(debug_name: str | None) -> AbstractContextManager[None]:
+    """Return a named NVTX range when enabled, otherwise a shared no-op context."""
+    if debug_name is None or not ENV.ENABLE_NVTX:
+        return _NULL_CONTEXT
+    from torch.cuda.nvtx import range
+
+    return range(debug_name)
 
 
 def nvtx_annotate(name: str, layer_id_field: str | None = None):

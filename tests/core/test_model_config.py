@@ -4,9 +4,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from loopsgl.core import LoopParams
 from loopsgl.models.config import ModelConfig
 from loopsgl.models.looped.config import OuroConfig
-from loopsgl.models.looped.huginn import HuginnForCausalLM
+from loopsgl.models.looped.huginn import HuginnModel
+
+
+@pytest.mark.parametrize("depth", [0, -1, True, 1.5])
+def test_invalid_loop_depth(depth: int | float) -> None:
+    with pytest.raises(ValueError, match="loop_steps must be a positive integer"):
+        LoopParams(loop_steps=depth)
 
 
 @pytest.mark.parametrize(
@@ -38,14 +45,12 @@ def test_rotary_style_config(fields: dict[str, bool], expected: bool) -> None:
 def test_huginn_nonpositive_state_init_std(std: float) -> None:
     """Nonpositive initialization variance preserves the zero recurrent state."""
     injection = torch.ones(3, 8)
-    model = HuginnForCausalLM.__new__(HuginnForCausalLM)
-    model.model = SimpleNamespace(
-        embed_tokens=SimpleNamespace(forward=lambda input_ids: injection),
-        prelude=SimpleNamespace(op_list=[]),
-    )
+    model = HuginnModel.__new__(HuginnModel)
+    model.embed_tokens = SimpleNamespace(forward=lambda input_ids: injection)
+    model.prelude = SimpleNamespace(op_list=[])
     model._embed_scale = 2.0
     model._state_init = "like-init"
     model._state_init_std = std
-    state, actual_injection = model.prelude(torch.tensor([1, 2, 3]))
+    state, actual_injection = model.forward_prelude(torch.tensor([1, 2, 3]))
     torch.testing.assert_close(state, torch.zeros_like(injection))
     torch.testing.assert_close(actual_injection, injection * 2)

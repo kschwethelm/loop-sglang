@@ -4,10 +4,11 @@ import importlib
 from typing import TYPE_CHECKING
 
 import torch
+
 from loopsgl.utils import init_logger
 
 if TYPE_CHECKING:
-    from loopsgl.engine.config import EngineConfig
+    from loopsgl.model_executor.config import EngineConfig
 
 logger = init_logger(__name__)
 
@@ -95,12 +96,22 @@ def select_attention_backend(config: EngineConfig) -> tuple[str, int]:
         raise ValueError("Query/KV head counts are incompatible with tensor parallelism.")
 
     capability = torch.cuda.get_device_capability(config.tp_info.rank)
+    last_exited = config.loop_cache_policy == "last_exited"
+    if last_exited:
+        if config.page_size != 1:
+            raise ValueError("Last-exited KV requires one-token pages")
+        if capability[0] not in (8, 9):
+            raise ValueError("Last-exited KV requires the FA3 attention backend")
+        if config.attention_backend not in ("auto", "fa"):
+            raise ValueError("Last-exited KV requires the FA3 attention backend")
     automatic = config.attention_backend == "auto"
     candidates = (
         ["trtllm", "fa", "fi"]
         if capability[0] == 10
         else (["fa", "fi"] if capability[0] in (9, 11) else ["fi", "fa"])
     )
+    if last_exited:
+        candidates = ["fa"]
     if not automatic:
         candidates = [config.attention_backend]
 

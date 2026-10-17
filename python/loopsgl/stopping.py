@@ -8,8 +8,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:
-    from loopsgl.core import SamplingParams
     from transformers import PreTrainedTokenizerBase
+
+    from loopsgl.core import SamplingParams
 
 MAX_STOP_COUNT = 32
 

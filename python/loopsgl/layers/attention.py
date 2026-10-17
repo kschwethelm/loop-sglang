@@ -3,9 +3,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
 from loopsgl.core import get_global_ctx
 from loopsgl.distributed import get_tp_info
 from loopsgl.utils import div_even
+from loopsgl.utils.breakable_graph import eager_on_graph, is_prefill_graph_warmup
 
 from .base import StateLessOP
 from .rotary import get_rope
@@ -13,6 +15,33 @@ from .rotary import get_rope
 if TYPE_CHECKING:
     from loopsgl.layers import RMSNorm
     from loopsgl.models import RotaryConfig
+
+
+@eager_on_graph()
+def _prefill_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    layer_id: int,
+    core_metadata_depth: int | torch.Tensor | None = None,
+) -> None:
+    """Write attention over real query rows into a stable token-bucket output.
+
+    The first core layer also prepares last-exited KV addresses for its depth.
+    """
+    if is_prefill_graph_warmup():
+        out.zero_()
+        return
+    ctx = get_global_ctx()
+    batch = ctx.batch
+    count = batch.prefill_num_tokens
+    assert count is not None
+    if core_metadata_depth is not None:
+        ctx.attn_backend.prepare_core_metadata(batch, core_metadata_depth)
+    result = ctx.attn_backend.forward(q[:count], k[:count], v[:count], layer_id, batch)
+    out[:count].copy_(result)
+    out[count:].zero_()
 
 
 class AttentionLayer(StateLessOP):
@@ -45,7 +74,13 @@ class AttentionLayer(StateLessOP):
         self.q_norm = q_norm
         self.k_norm = k_norm
 
-    def forward(self, qkv: torch.Tensor, *, cache_layer_id: int | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        *,
+        cache_layer_id: int | None = None,
+        core_metadata_depth: int | torch.Tensor | None = None,
+    ) -> torch.Tensor:
         ctx = get_global_ctx()
         q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
         if self.q_norm is not None:
@@ -55,5 +90,11 @@ class AttentionLayer(StateLessOP):
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         layer_id = self.layer_id if cache_layer_id is None else cache_layer_id
-        o = ctx.attn_backend.forward(q, k, v, layer_id, ctx.batch)
+        if ctx.batch.prefill_num_tokens is not None:
+            o = torch.empty_like(q)
+            _prefill_attention(q, k, v, o, layer_id, core_metadata_depth)
+        else:
+            if core_metadata_depth is not None:
+                ctx.attn_backend.prepare_core_metadata(ctx.batch, core_metadata_depth)
+            o = ctx.attn_backend.forward(q, k, v, layer_id, ctx.batch)
         return o.view(-1, self.qo_attn_dim)

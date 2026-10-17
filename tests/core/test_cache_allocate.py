@@ -7,7 +7,7 @@ from __future__ import annotations
 import loopsgl.core as core
 import pytest
 import torch
-from loopsgl.scheduler.cache import CacheManager
+from loopsgl.managers.scheduler_components.cache import CacheManager
 
 
 @pytest.fixture(autouse=True)
@@ -24,7 +24,7 @@ def _make_cache_manager(num_pages: int, page_size: int) -> CacheManager:
     page_table = torch.empty((1,))
     ctx = core.Context(page_size=page_size)
     core.set_global_ctx(ctx)
-    return CacheManager(num_pages, page_size, page_table, type="radix")
+    return CacheManager(num_pages, page_size, page_table, disable_radix_cache=False)
 
 
 def _insert_evictable(cm: CacheManager, input_ids: torch.Tensor, indices: torch.Tensor):
