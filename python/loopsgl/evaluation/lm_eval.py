@@ -12,8 +12,9 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 from lm_eval.models.utils import Collator, handle_stop_sequences, postprocess_generated_text
-from loopsgl.core import SamplingParams
 from tqdm import tqdm
+
+from loopsgl.core import LoopParams, SamplingParams
 
 GenerationRequest = Tuple[Tuple[str, List[int]], Dict[str, Any]]
 
@@ -32,11 +33,16 @@ class LoopSGLangLM(TemplateLM):
         dtype: str | torch.dtype = "bfloat16",
         device: str | None = "cuda",
         think_end_token: str | None = None,
+        loop_steps: int | None = None,
+        exit_threshold: float | None = None,
+        refill: bool = True,
+        min_coda_batch_size: int = 1,
+        disable_lookahead_exit: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         if device not in (None, "cuda", "cuda:0"):
-            raise ValueError("The offline Loop-SGLang backend supports a single CUDA GPU.")
+            raise ValueError("Use device=cuda and configure tensor parallelism through tp_size.")
         self.batch_size = "auto" if batch_size == "auto" else int(batch_size)
         if self.batch_size != "auto" and self.batch_size <= 0:
             raise ValueError("batch_size must be positive or 'auto'.")
@@ -58,14 +64,25 @@ class LoopSGLangLM(TemplateLM):
                 raise ValueError(f"Unsupported dtype: {dtype}. Choose from {tuple(dtypes)}.")
             dtype = dtypes[dtype]
 
-        from loopsgl.llm import LLM
+        from loopsgl import Engine
+        from loopsgl.managers.scheduler_components.config import CDBConfig
 
         torch_seed = torch.initial_seed()
-        self.model = LLM(pretrained, dtype=dtype, **kwargs)
-        # Engine initialization seeds Torch; restore the evaluator's sampling seed.
+        self.model = Engine(
+            pretrained,
+            dtype=dtype,
+            loop_params=LoopParams(loop_steps=loop_steps, exit_threshold=exit_threshold),
+            cdb_config=CDBConfig(
+                refill=refill,
+                min_coda_batch_size=min_coda_batch_size,
+                disable_lookahead_exit=disable_lookahead_exit,
+            ),
+            **kwargs,
+        )
+        # Keep the evaluator's caller-side sampling seed unchanged.
         torch.manual_seed(torch_seed)
         self.tokenizer = self.model.tokenizer
-        self._max_length = self.model.engine.max_seq_len
+        self._max_length = self.model.max_seq_len
         self._max_gen_toks = max_gen_toks
         self.add_bos_token = add_bos_token or "gemma" in pretrained.lower()
         self.think_end_token = think_end_token
@@ -121,9 +138,12 @@ class LoopSGLangLM(TemplateLM):
         self,
         chat_history: List[Dict[str, str]],
         add_generation_prompt: bool = True,
+        chat_template_kwargs: Dict[str, Any] | None = None,
     ) -> str:
-        return self.tokenizer.apply_chat_template(
-            chat_history, tokenize=False, add_generation_prompt=add_generation_prompt
+        return self.model.tokenizer_manager.apply_chat_template(
+            chat_history,
+            add_generation_prompt=add_generation_prompt,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
     def generate_until(self, requests: List[Instance], disable_tqdm: bool = False) -> List[str]:
@@ -195,7 +215,7 @@ class LoopSGLangLM(TemplateLM):
     def _model_generate(
         self, requests: List[List[int]], sampling_params: List[SamplingParams]
     ) -> List[Dict[str, str | List[int]]]:
-        return self.model.generate(prompts=requests, sampling_params=sampling_params)
+        return self.model.generate(input_ids=requests, sampling_params=sampling_params)
 
     @staticmethod
     def modify_gen_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:

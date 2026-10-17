@@ -5,8 +5,8 @@ from typing import List
 
 import torch
 from loopsgl.core import SamplingParams
-from loopsgl.message import BatchBackendMsg, UserMsg
-from loopsgl.message.utils import deserialize_type, serialize_type
+from loopsgl.managers.io_struct import BatchTokenizedGenerateReqInput, TokenizedGenerateReqInput
+from loopsgl.utils.serialization import deserialize_type, serialize_type
 
 
 @dataclass
@@ -31,12 +31,14 @@ def test_serialize_deserialize() -> None:
     torch.testing.assert_close(y.z[0].w, t)
 
     params = SamplingParams(temperature=0.7, max_tokens=17, ignore_eos=True)
-    u = BatchBackendMsg([UserMsg(uid=42, input_ids=t, sampling_params=params)])
+    u = BatchTokenizedGenerateReqInput(
+        [TokenizedGenerateReqInput(uid=42, input_ids=t, sampling_params=params)]
+    )
     result = u.decoder(u.encoder())
-    assert isinstance(result, BatchBackendMsg)
-    assert len(result.data) == 1
-    message = result.data[0]
-    assert isinstance(message, UserMsg)
+    assert isinstance(result, BatchTokenizedGenerateReqInput)
+    assert len(result.batch) == 1
+    message = result.batch[0]
+    assert isinstance(message, TokenizedGenerateReqInput)
     assert message.uid == 42
     torch.testing.assert_close(message.input_ids, t)
     assert message.sampling_params == params

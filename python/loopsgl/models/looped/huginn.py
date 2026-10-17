@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import isfinite
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -13,14 +14,18 @@ from loopsgl.layers import (
     RMSNormFused,
     VocabParallelEmbedding,
 )
-from loopsgl.utils import nvtx_annotate
+from loopsgl.utils import init_logger, nvtx_annotate
 
 from ..utils import GatedMLP, RopeAttn
-from .base import BaseLoopedModel
+from .base import BaseLoopedForCausalLM, BaseLoopedModel
 from .config import HuginnConfig
+from .exit_gates import relative_state_change
 
 if TYPE_CHECKING:
     from ..config import ModelConfig
+
+
+logger = init_logger(__name__)
 
 
 class HuginnAttention(RopeAttn):
@@ -29,12 +34,20 @@ class HuginnAttention(RopeAttn):
         super().__init__(config, layer_id, has_attn_bias=hf_config.attention_bias)
 
     @nvtx_annotate("MHA")
-    def forward(self, x: torch.Tensor, *, cache_layer_id: int | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cache_layer_id: int | None = None,
+        core_metadata_depth: int | torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # Huginn adds its query/key bias after rounding the projection to the model dtype.
         qkv = F.linear(x, self.qkv_proj.weight)
         if self.qkv_proj.bias is not None:
             qkv.add_(self.qkv_proj.bias)
-        o = self.attn.forward(qkv, cache_layer_id=cache_layer_id)
+        o = self.attn.forward(
+            qkv, cache_layer_id=cache_layer_id, core_metadata_depth=core_metadata_depth
+        )
         return self.o_proj.forward(o)
 
 
@@ -55,10 +68,13 @@ class HuginnDecoderLayer(BaseOP):
         x: torch.Tensor,
         *,
         cache_layer_id: int | None = None,
+        core_metadata_depth: int | torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = x
         x = self.input_layernorm.forward(x)
-        x = self.self_attn.forward(x, cache_layer_id=cache_layer_id)
+        x = self.self_attn.forward(
+            x, cache_layer_id=cache_layer_id, core_metadata_depth=core_metadata_depth
+        )
         x = self.input_layernorm_2.forward(x, residual)[0]
         residual = x
         x = self.post_attention_layernorm.forward(x)
@@ -67,11 +83,19 @@ class HuginnDecoderLayer(BaseOP):
         return x
 
 
-class HuginnModel(BaseOP):
-    """Layer and weight container for staged Huginn execution."""
-
+class HuginnModel(BaseLoopedModel):
     def __init__(self, config: ModelConfig) -> None:
         hf_config = cast(HuginnConfig, config.hf_config)
+        super().__init__(
+            loop_steps=config.loop_steps,
+            num_core_layers=hf_config.num_core_layers,
+            num_prelude_layers=hf_config.num_prelude_layers,
+            num_coda_layers=hf_config.num_coda_layers,
+            exit_threshold=config.loop_params.exit_threshold,
+        )
+        threshold = self.loop_params.exit_threshold
+        if threshold is not None and (not isfinite(threshold) or threshold < 0):
+            raise ValueError("Huginn exit_threshold must be finite and nonnegative")
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -103,19 +127,82 @@ class HuginnModel(BaseOP):
             eps=config.rms_norm_eps,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Execute Huginn through HuginnForCausalLM's loop stages.")
+        self._embed_scale = hf_config.init_values["embed_scale"]
+        self._state_init_std = hf_config.init_values["std"]
+        self._state_init = hf_config.state_init
+        if self._state_init != "zero" and self._state_init_std > 0:
+            logger.warning_rank0(
+                "Huginn uses random loop-state initialization. "
+                "This makes the forward pass non-deterministic. "
+                "This affects prefix caching and retraction with recomputation."
+            )
 
+    def cdb_state_spec(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Describe shapes and dtypes of per-token states retained between CDB execution stages."""
+        weight = self.embed_tokens.weight
+        hidden = ((weight.shape[-1],), weight.dtype)
+        return {"hidden": hidden, "injection": hidden, "exit": hidden}
 
-class HuginnForCausalLM(BaseLoopedModel):
-    def __init__(self, config: ModelConfig) -> None:
-        hf_config = cast(HuginnConfig, config.hf_config)
-        super().__init__(
-            loop_steps=config.loop_steps,
-            num_core_layers=hf_config.num_core_layers,
-            num_prelude_layers=hf_config.num_prelude_layers,
-            num_coda_layers=hf_config.num_coda_layers,
+    def forward_prelude(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        injection = self.embed_tokens.forward(input_ids)
+        injection = injection * self._embed_scale
+        for layer_id, layer in enumerate(self.prelude.op_list):
+            injection = layer.forward(
+                injection, cache_layer_id=self.prelude_cache_layer_index(layer_id)
+            )
+        if self._state_init != "zero" and self._state_init_std > 0:
+            state = torch.empty_like(injection)
+            std = self._state_init_std
+            torch.nn.init.trunc_normal_(state, std=std, a=-3 * std, b=3 * std)
+            state.mul_(self._embed_scale)
+        else:
+            state = torch.zeros_like(injection)
+        return state, injection
+
+    def core_step(
+        self,
+        hidden_states: torch.Tensor,
+        loop_step: int | torch.Tensor,
+        injection: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert injection is not None
+        x = self.adapter.forward(torch.cat([hidden_states, injection], dim=-1))
+        for layer_id, layer in enumerate(self.layers.op_list):
+            x = layer.forward(
+                x,
+                cache_layer_id=self.core_cache_layer_index(layer_id, loop_step),
+                core_metadata_depth=(
+                    loop_step if layer_id == 0 and self.loop_cache_policy == "last_exited" else None
+                ),
+            )
+        return x
+
+    def init_exit_state(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Use the initial recurrent state as the first comparison's previous state."""
+        return hidden_states
+
+    def exit_signal(
+        self,
+        hidden_states: torch.Tensor,
+        exit_state: torch.Tensor,
+        loop_step: int | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Threshold relative state change to request an exit."""
+        return (
+            relative_state_change(hidden_states, exit_state) < self.loop_params.exit_threshold,
+            hidden_states,
         )
+
+    def forward_coda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x = self.norm.forward(hidden_states)
+        for layer_id, layer in enumerate(self.coda.op_list):
+            x = layer.forward(x, cache_layer_id=self.coda_cache_layer_index(layer_id))
+        x = self.norm.forward(x)
+        return x
+
+
+class HuginnForCausalLM(BaseLoopedForCausalLM):
+    def __init__(self, config: ModelConfig) -> None:
         self.model = HuginnModel(config)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
@@ -123,39 +210,6 @@ class HuginnForCausalLM(BaseLoopedModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
-        self._embed_scale = hf_config.init_values["embed_scale"]
-        self._state_init_std = hf_config.init_values["std"]
-        self._state_init = hf_config.state_init
-
-    def prelude(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        injection = self.model.embed_tokens.forward(input_ids)
-        injection = injection * self._embed_scale
-        for layer_id, layer in enumerate(self.model.prelude.op_list):
-            injection = layer.forward(
-                injection, cache_layer_id=self.prelude_cache_layer_index(layer_id)
-            )
-        state = torch.zeros_like(injection)
-        if self._state_init != "zero" and self._state_init_std > 0:
-            std = self._state_init_std
-            torch.nn.init.trunc_normal_(state, std=std, a=-3 * std, b=3 * std)
-            state.mul_(self._embed_scale)
-        return state, injection
-
-    def core_step(
-        self, hidden_states: torch.Tensor, loop_step: int, injection: torch.Tensor | None
-    ) -> torch.Tensor:
-        assert injection is not None
-        x = self.model.adapter.forward(torch.cat([hidden_states, injection], dim=-1))
-        for layer_id, layer in enumerate(self.model.layers.op_list):
-            x = layer.forward(x, cache_layer_id=self.core_cache_layer_index(layer_id, loop_step))
-        return x
-
-    def coda(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        x = self.model.norm.forward(hidden_states)
-        for layer_id, layer in enumerate(self.model.coda.op_list):
-            x = layer.forward(x, cache_layer_id=self.coda_cache_layer_index(layer_id))
-        x = self.model.norm.forward(x)
-        return self.lm_head.forward(x)
 
 
 __all__ = ["HuginnForCausalLM"]

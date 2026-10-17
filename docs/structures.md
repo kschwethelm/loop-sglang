@@ -19,7 +19,10 @@ It consists of several independent processes working together.
 
 The components communicate using **ZeroMQ (ZMQ)** for control messages and **NCCL** (via `torch.distributed`) for heavy tensor data exchange between GPUs.
 
-![Process overview diagram](https://lmsys.org/images/blog/minisgl/design.drawio.png)
+```text
+Frontend (API or Python client, TokenizerManager) -> Scheduler
+Frontend <- Detokenizer <- Scheduler
+```
 
 **Request Lifecycle:**
 
@@ -27,7 +30,7 @@ The components communicate using **ZeroMQ (ZMQ)** for control messages and **NCC
 2. **API Server** forwards it to the **Tokenizer**.
 3. **Tokenizer** converts text to tokens and sends them to the **Scheduler (Rank 0)**.
 4. **Scheduler (Rank 0)** broadcasts the request to all other Schedulers (if using multiple GPUs).
-5. **All Schedulers** schedule the request and trigger their local **Engine** to compute the next token.
+5. **All Schedulers** schedule the request and trigger their local **ModelRunner** to compute the next token.
 6. **Scheduler (Rank 0)** collects the output token and sends it to the **Detokenizer**.
 7. **Detokenizer** converts the token to text and sends it back to the **API Server**.
 8. **API Server** streams the result back to the **User**.
@@ -37,7 +40,7 @@ The components communicate using **ZeroMQ (ZMQ)** for control messages and **NCC
 The source code is located in `python/loopsgl`.
 Here is a breakdown of the modules for developers:
 
-- `loopsgl.core`: Provides core dataclasses `Req` and `Batch` representing the state of requests, class `Context` which holds the global state of the inference context, and class `SamplingParams` holds the sampling parameters provided by users.
+- `loopsgl.core`: Provides persistent request state in `Req`, execution snapshots in `ForwardBatch`, the global inference `Context`, and user-provided `SamplingParams`.
 - `loopsgl.distributed`: Provides the interface to all-reduce and all-gather in tensor parallelism, and dataclass `DistributedInfo` which holds the TP information for a TP worker.
 - `loopsgl.layers`: Implements basic building blocks for building LLMs with TP support, including linear, layernorm, embedding, RoPE, etc.
   They share common base classes defined in `loopsgl.layers.base`.
@@ -45,17 +48,23 @@ Here is a breakdown of the modules for developers:
   Also defines utilities for loading weights from huggingface and sharding weights.
 - `loopsgl.attention`: Provides interface of attention Backends and implements backends of `flashattention` and `flashinfer`.
   They are called by `AttentionLayer` and use metadata stored in `Context`.
-- `loopsgl.kvcache`: Provides interface of KVCache pool and KVCache manager, and implements `MHAKVCache`, `NaiveCacheManager` and `RadixCacheManager`.
-- `loopsgl.utils`: Provides a collection of utilities, including logger setup and wrappers around zmq.
-- `loopsgl.engine`: Implements `Engine` class, which is a TP worker on a single process.
+  FlashAttention and TRTLLM prepare lengths, cumulative lengths, and page tables on GPU directly into reusable eager or CUDA graph buffers.
+  FlashInfer retains CPU metadata for wrapper planning.
+- `loopsgl.kvcache`: Provides interface of KVCache pool and KVCache manager, and implements `MHAKVCache`, `NoPrefixCache` and `RadixCacheManager`.
+- `loopsgl.utils`: Provides a collection of utilities, including logger setup, wrappers around zmq, and IPC serialization helpers.
+- `loopsgl.model_executor`: Implements `ModelRunner`, which executes model batches on one tensor-parallel rank.
   It manages the model, context, KVCache, attention backend and cuda graph replaying.
-- `loopsgl.message`: Defines messages exchanged (in zmq) between api_server, tokenizer, detokenizer and scheduler.
-  All message types support automatic serialization and deserialization.
-- `loopsgl.scheduler`: Implements `Scheduler` class, which runs on each TP worker process and manages the corresponding `Engine`.
-  The rank 0 scheduler receives msgs from tokenizer, communicates with scheduler on other TP workers, and sends msgs to detokenizer.
-- `loopsgl.server`: Defines cli arguments and `launch_server` which starts all the subprocesses of Loop-SGLang.
-  Also implements a FastAPI server in `loopsgl.server.api_server` acting as a frontend, providing endpoints such as `/v1/chat/completions`.
-- `loopsgl.tokenizer`: Implements `tokenize_worker` function which handles tokenization and detokenization requests.
-- `loopsgl.llm`: Provides class `LLM` as a python interface to interact with the Loop-SGLang system easily.
+- `loopsgl.server_args`: Defines and resolves CLI arguments for the inference runtime.
+- `loopsgl.cli`: Provides the `loopsgl serve` command and forwards serving options to the shared server argument parser.
+- `loopsgl.launch_server`: Dispatches resolved server arguments to the HTTP or interactive shell frontend.
+- `loopsgl.managers`: Implements `TokenizerManager`, `DetokenizerManager`, and the CB and CDB schedulers.
+  `scheduler.py` and `cdb_scheduler.py` share `BaseScheduler` from `base_scheduler.py` and each manage a local `ModelRunner`.
+  The rank 0 scheduler receives tokenized requests, broadcasts them to other TP ranks, and sends generated tokens to the detokenizer.
+  `schedule_batch.py` retains decode request indices, sequence lengths, and sampling tensors between steps.
+  `scheduler_components` contains shared prefill, decode, resource management, I/O, and result-processing helpers.
+  Input tokenization uses one frontend manager, with no tokenizer worker processes or tokenizer IPC channel.
+  `managers.io_struct` defines frontend inputs and the request and response types exchanged over ZMQ between managers and schedulers.
+- `loopsgl.entrypoints`: Provides the public `Engine` interface and launches the shared inference workers for Python and HTTP clients.
+  `entrypoints.http_server` owns the FastAPI application, HTTP and shell serving, and the server worker lifecycle.
 - `loopsgl.kernel`: Implements custom CUDA kernels, supported by `tvm-ffi` for python binding and jit interface.
 - `loopsgl.benchmark`: Benchmark utilities.

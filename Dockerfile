@@ -68,5 +68,5 @@ USER loopsgl
 
 EXPOSE 1919
 
-ENTRYPOINT ["python", "-m", "loopsgl"]
+ENTRYPOINT ["loopsgl", "serve"]
 CMD ["--help"]

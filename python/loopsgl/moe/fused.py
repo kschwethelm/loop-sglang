@@ -2,6 +2,7 @@ import functools
 from typing import Dict, Tuple
 
 import torch
+
 from loopsgl.moe import BaseMoeBackend
 from loopsgl.utils import div_ceil
 

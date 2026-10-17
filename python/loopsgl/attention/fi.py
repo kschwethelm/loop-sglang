@@ -6,12 +6,14 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List, Literal
 
 import torch
-from loopsgl.core import Batch, get_global_ctx
+
+from loopsgl.core import ForwardBatch, get_global_ctx
 from loopsgl.distributed import get_tp_info
 from loopsgl.env import ENV
 from loopsgl.utils import div_even, init_logger
 
 from .base import BaseAttnBackend, BaseAttnMetadata
+from .metadata import create_flashinfer_kv_indices
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
         BatchPrefillWithPagedKVCacheWrapper,
         CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     )
+
     from loopsgl.models import ModelConfig
 
 
@@ -123,6 +126,8 @@ class FlashInferBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
+        self.kv_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.cu_seqlens_k = torch.empty(0, dtype=torch.int32, device=self.device)
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
@@ -180,7 +185,7 @@ class FlashInferBackend(BaseAttnBackend):
         return self.cached_ones_cpu[:bs]
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: ForwardBatch
     ) -> torch.Tensor:
         def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:  # treat page = 1
             return cache.view(-1, 1, cache.shape[2], cache.shape[3])
@@ -193,13 +198,11 @@ class FlashInferBackend(BaseAttnBackend):
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
-    def prepare_metadata(self, batch: Batch) -> None:
-        reqs = batch.padded_reqs
-
-        padded_size = len(reqs)
-        seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
-        cached_lens = [req.cached_len for req in reqs]
+    def prepare_metadata(self, batch: ForwardBatch) -> None:
+        padded_size = batch.padded_size
+        seqlens_q = list(batch.extend_lens_cpu)
+        seqlens_k = list(batch.seq_lens_cpu)
+        cached_lens = [k - q for k, q in zip(seqlens_k, seqlens_q)]
         max_seqlen_q = max(seqlens_q)
         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 
@@ -213,12 +216,35 @@ class FlashInferBackend(BaseAttnBackend):
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
-        page_table = get_global_ctx().page_table
+        if self.cu_seqlens_k.numel() < padded_size + 1:
+            self.cu_seqlens_k = torch.empty(
+                _next_power_of_2(padded_size + 1), dtype=torch.int32, device=device
+            )
+        self.cu_seqlens_k[0].zero_()
+        torch.cumsum(batch.seq_lens, dim=0, out=self.cu_seqlens_k[1 : padded_size + 1])
+        num_kv_indices = sum(seqlens_k)
+        if self.capture is not None and batch.is_decode and padded_size in self.capture_bs:
+            # Gather directly into the indices buffer owned by graph replay.
+            indices = self.capture.indices[:num_kv_indices]
+        else:
+            if self.kv_indices.numel() < num_kv_indices:
+                self.kv_indices = torch.empty(
+                    _next_power_of_2(num_kv_indices), dtype=torch.int32, device=device
+                )
+            indices = self.kv_indices[:num_kv_indices]
+        assert indices.numel() == num_kv_indices
+        create_flashinfer_kv_indices(
+            get_global_ctx().page_table,
+            batch.req_pool_indices,
+            batch.seq_lens,
+            self.cu_seqlens_k[: padded_size + 1],
+            indices,
+        )
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
+            indices=indices,
             last_page_len_cpu=self._get_ones_cpu(padded_size),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
@@ -247,29 +273,31 @@ class FlashInferBackend(BaseAttnBackend):
         GQA = self.config.num_qo_heads // self.config.num_kv_heads
         return GQA >= 4
 
-    def prepare_for_capture(self, batch: Batch) -> None:
+    def prepare_for_capture(self, batch: ForwardBatch) -> None:
         from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
         bs = batch.size
-        assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
+        assert bs in self.capture_bs and self.capture
         capture = self.capture
-        self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout="NHD",
-            use_tensor_cores=self.use_tensor_cores,
-            indptr_buffer=capture.cu_seqlens_k[: bs + 1],
-            indices_buffer=capture.indices,
-            last_page_len_buffer=capture.one_tensor[:bs],
-        )
-        self.graph_wrappers[bs]._backend = "fa2"
-        self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
+        if bs not in self.graph_wrappers:
+            self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                use_tensor_cores=self.use_tensor_cores,
+                indptr_buffer=capture.cu_seqlens_k[: bs + 1],
+                indices_buffer=capture.indices,
+                last_page_len_buffer=capture.one_tensor[:bs],
+            )
+            self.graph_wrappers[bs]._backend = "fa2"
+            self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
 
-    def prepare_for_replay(self, batch: Batch) -> None:
+    def prepare_for_replay(self, batch: ForwardBatch) -> None:
+        self.prepare_metadata(batch)
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FIMetadata) and not metadata.initialized
         assert self.capture is not None and bs in self.capture_bs

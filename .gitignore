@@ -36,8 +36,9 @@ env/
 /AGENTS.md
 /outputs/
 
-# Local paper checkout
+# Local docs
 /docs/paper
+/docs/specs
 
 # Private machine configurations
 /shells/_machine_config.sh

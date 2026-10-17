@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
-from loopsgl.core import Batch, get_global_ctx
+
+from loopsgl.core import ForwardBatch, get_global_ctx
 
 from .base import BaseAttnBackend, BaseAttnMetadata
-from .utils import BaseCaptureData
+from .utils import BaseCaptureData, get_metadata_buffer, prepare_paged_metadata
 
 if TYPE_CHECKING:
     from loopsgl.models import ModelConfig
@@ -39,6 +40,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
         self.capture: TRTLLMCaptureData | None = None
+        self.eager: BaseCaptureData | None = None
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
@@ -47,7 +49,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
         )
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: ForwardBatch
     ) -> torch.Tensor:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
         from flashinfer.prefill import trtllm_batch_context_with_kv_cache
@@ -88,57 +90,31 @@ class TensorRTLLMBackend(BaseAttnBackend):
                 out_dtype=q.dtype,
             )
 
-    def prepare_metadata(self, batch: Batch) -> None:
-        reqs = batch.padded_reqs
-
-        padded_size = len(reqs)
-        seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
-        cached_lens = [req.cached_len for req in reqs]
-        max_seqlen_k = max(seqlens_k)
-        max_seqlen_q = max(seqlens_q)
-        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
-
-        device = self.kvcache.device
-        cache_seqlens = torch.tensor(seqlens_k, **CPU_KWARGS)
-        cache_seqlens = cache_seqlens.to(device, non_blocking=True)
-        cu_seqlens_k = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
-        cu_seqlens_k = cu_seqlens_k.to(device, non_blocking=True)
-
-        if max_seqlen_q == 1:
-            cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
-        elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
-            cu_seqlens_q = cu_seqlens_k
-        else:  # normal extend prefill, with partial cache hit
-            cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
-            cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
-
-        page_table = get_global_ctx().page_table
-        new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
-            [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
-        )
-        if self.page_size > 1:
-            new_page_table.div_(self.page_size, rounding_mode="floor")
+    def prepare_metadata(self, batch: ForwardBatch) -> None:
+        self.eager = get_metadata_buffer(batch, self.eager, self.page_size)
+        prepare_paged_metadata(batch, self.eager, self.page_size)
+        bs = batch.padded_size
         batch.attn_metadata = TRTLLMMetadata(
-            cu_seqlens_k=cu_seqlens_k,
-            cu_seqlens_q=cu_seqlens_q,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_k=max_seqlen_k,
-            max_seqlen_q=max_seqlen_q,
-            page_table=new_page_table,
+            cu_seqlens_k=self.eager.cu_seqlens_k[: bs + 1],
+            cu_seqlens_q=self.eager.cu_seqlens_q[: bs + 1],
+            cache_seqlens=self.eager.seq_lens[:bs],
+            max_seqlen_k=max(batch.seq_lens_cpu),
+            max_seqlen_q=max(batch.extend_lens_cpu),
+            # TRTLLM derives the row stride from width, so expose the full capacity.
+            page_table=self.eager.page_table[:bs],
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = TRTLLMCaptureData.create(
-            max_bs, max_seq_len // self.page_size, self.kvcache.device
+            max_bs, (max_seq_len + self.page_size - 1) // self.page_size, self.kvcache.device
         )
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
 
-    def prepare_for_capture(self, batch: Batch) -> None:
+    def prepare_for_capture(self, batch: ForwardBatch) -> None:
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
         metadata = TRTLLMMetadata(
@@ -151,12 +127,15 @@ class TensorRTLLMBackend(BaseAttnBackend):
         )
         batch.attn_metadata = metadata
 
-    def prepare_for_replay(self, batch: Batch) -> None:
-        metadata, bs = batch.attn_metadata, batch.padded_size
-        assert isinstance(metadata, TRTLLMMetadata)
+    def prepare_for_replay(self, batch: ForwardBatch) -> None:
+        bs = batch.padded_size
         assert self.capture is not None and bs in self.capture_bs
-        # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
-        table_len = metadata.page_table.size(1)
-        self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
-        self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
-        self.capture.page_table[:bs, :table_len].copy_(metadata.page_table)
+        prepare_paged_metadata(batch, self.capture, self.page_size)
+        batch.attn_metadata = TRTLLMMetadata(
+            cu_seqlens_k=self.capture.cu_seqlens_k[: bs + 1],
+            cu_seqlens_q=self.capture.cu_seqlens_q[: bs + 1],
+            cache_seqlens=self.capture.seq_lens[:bs],
+            max_seqlen_k=self.capture.page_table.size(1) * self.page_size,
+            max_seqlen_q=1,
+            page_table=self.capture.page_table[:bs],
+        )

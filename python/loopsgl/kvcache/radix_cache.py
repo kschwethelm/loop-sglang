@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, TypeAlias
 
 import torch
+
 from loopsgl.core import get_global_ctx
 from loopsgl.utils import align_down
 

@@ -4,7 +4,7 @@
 
 Loop-SGLang supports online serving with an OpenAI-compatible API server.
 It provides the standard `/v1/chat/completions` endpoint, allowing seamless integration with existing tools and clients.
-For detailed command-line arguments and configuration options, run `python -m loopsgl --help`.
+For detailed command-line arguments and configuration options, run `loopsgl serve --help`.
 
 ## Interactive Shell Mode
 
@@ -16,7 +16,7 @@ To clear the conversation history and start a new session, use the `/reset` comm
 Example:
 
 ```bash
-python -m loopsgl --model "Qwen/Qwen3-0.6B" --shell
+loopsgl serve --model "KristianS7/Ouro-1.4B" --shell
 ```
 
 ## Distributed Serving
@@ -26,13 +26,15 @@ You can enable distributed serving by specifying the number of GPUs with the `--
 
 ## Supported Models
 
-Our framework currently supports the following dense model architectures:
+Our framework currently supports the following looped model architectures:
+- [`Ouro`](https://huggingface.co/KristianS7/Ouro-1.4B)
+- [`Huginn`](https://huggingface.co/KristianS7/huginn-0125)
+
+And the following standard model architectures:
 
 - [`Llama-3`](https://huggingface.co/collections/meta-llama/llama-31) series
 - [`Qwen-3`](https://huggingface.co/collections/Qwen/qwen3) series (including MoE)
 - [`Qwen-2.5`](https://huggingface.co/collections/Qwen/qwen25) series
-- [`Ouro`](https://huggingface.co/KristianS7/Ouro-1.4B)
-- [`Huginn`](https://huggingface.co/KristianS7/huginn-0125)
 
 ## Chunked Prefill
 
@@ -63,11 +65,20 @@ This feature is enabled by default.
 The maximum batch size for CUDA graph capture can be set with `--cuda-graph-max-bs n`.
 Setting `n` to `0` disables this feature.
 
+Prefill uses SGLang-style breakable CUDA graphs by default.
+The transformer body replays in total query-token buckets, while attention and final-row logits processing use the current batch's real lengths.
+Padded rows never reach the KV cache.
+
+Use `--cuda-graph-backend-prefill disabled` to run prefill eagerly.
+Use `--cuda-graph-max-bs-prefill n` to cap captured query-token counts or `--cuda-graph-bs-prefill 128 256 512` to select explicit buckets.
+The default cap is the prefill token budget.
+Batches above the cap, or requiring more than twice their real token count in padding, run eagerly.
+
 ## Radix Cache
 
 Adopting the original design from [SGLang](https://github.com/sgl-project/sglang.git), Loop-SGLang implements a Radix Cache to manage the Key-Value (KV) cache.
 This allows the reuse of KV cache for shared prefixes across requests, reducing redundant computation.
-This feature is enabled by default but can be switched to a naive cache management strategy using `--cache naive`.
+This feature is enabled by default and can be disabled with `--disable-radix-cache`.
 
 ![radix](https://lmsys.org/images/blog/sglang/radix_attn.jpg)
 *Illustration of Radix Attention from [LMSYS Blog](https://lmsys.org/blog/2024-01-17-sglang/).*
@@ -79,3 +90,11 @@ This approach overlaps the CPU scheduling overhead with GPU computation, improvi
 
 ![overlap](https://lmsys.org/images/blog/sglang_v0_4/scheduler.jpg)
 *Illustration of Overlap Scheduling from [LMSYS Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/).*
+
+## Retraction (Preemption)
+
+When we run out of memory (i.e., cannot allocate KV cache for another token), we retract running sequences through CPU offloading or recomputation.
+We first process outstanding outputs so finished sequences can free their memory.
+If we still need more memory, we retract sequences until all remaining sequences can generate their next token.
+We preferentially retract sequences with shorter outputs and longer inputs.
+Retracted sequences resume later, either by restoring their KV cache from CPU memory or by recomputing it from their token history.

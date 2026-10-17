@@ -8,6 +8,7 @@ import functools
 from typing import TYPE_CHECKING
 
 import torch
+
 from loopsgl.utils import init_logger
 
 from .utils import KernelConfig, load_jit, make_cpp_args

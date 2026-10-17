@@ -5,6 +5,8 @@ from typing import Any, Dict
 
 from transformers import PretrainedConfig
 
+from loopsgl.core import LoopParams
+
 
 @dataclass(frozen=True)
 class RotaryConfig:
@@ -35,15 +37,21 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
-    loop_steps: int = 1
+    loop_params: LoopParams = LoopParams(loop_steps=1)
     hf_config: PretrainedConfig | None = None
+
+    @property
+    def loop_steps(self) -> int:
+        return 1 if self.loop_params.loop_steps is None else self.loop_params.loop_steps
 
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type
 
     @classmethod
-    def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
+    def from_hf(
+        cls, config: PretrainedConfig, *, loop_params: LoopParams | None = None
+    ) -> ModelConfig:
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
             config = config.text_config
@@ -66,6 +74,7 @@ class ModelConfig:
         # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
         rope_scaling = getattr(config, "rope_scaling", None)
         rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
+        params = loop_params or LoopParams()
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -94,6 +103,13 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
-            loop_steps=getattr(config, "loop_steps", 1),
+            loop_params=LoopParams(
+                loop_steps=(
+                    params.loop_steps
+                    if params.loop_steps is not None
+                    else getattr(config, "loop_steps", 1)
+                ),
+                exit_threshold=params.exit_threshold,
+            ),
             hf_config=config,
         )

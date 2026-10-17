@@ -39,6 +39,9 @@ dependencies = [
     "nvidia-cutlass-dsl==4.4.1",
 ]
 
+[project.scripts]
+loopsgl = "loopsgl.cli.main:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=6.0",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Tuple
 
 import torch
+
 from loopsgl.core import get_global_ctx
 from loopsgl.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
 from loopsgl.utils import nvtx_annotate

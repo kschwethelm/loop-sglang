@@ -8,18 +8,19 @@ from typing import Literal
 
 import pytest
 import torch
-from loopsgl.core import Batch, Req, SamplingParams
+from loopsgl.core import Req, SamplingParams
 from loopsgl.distributed import DistributedInfo
-from loopsgl.engine.config import EngineConfig
-from loopsgl.engine.engine import Engine
+from loopsgl.model_executor.config import EngineConfig
+from loopsgl.model_executor.model_runner import ModelRunner
 from loopsgl.models.looped.base import BaseLoopedModel
 from loopsgl.models.looped.config import OuroConfig
+from loopsgl.managers.schedule_batch import ScheduleBatch
 
 LoopCachePolicy = Literal["depth_indexed", "shared"]
 
 
 class LayoutModel(BaseLoopedModel):
-    def prelude(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward_prelude(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         return input_ids, None
 
     def core_step(
@@ -27,7 +28,7 @@ class LayoutModel(BaseLoopedModel):
     ) -> torch.Tensor:
         return hidden_states
 
-    def coda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_coda(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states
 
 
@@ -72,8 +73,8 @@ def test_loop_cache_layout(
 )
 @pytest.mark.parametrize("policy", ["depth_indexed", "shared"])
 def test_ouro_loop_cache(policy: LoopCachePolicy, tmp_path: Path) -> None:
-    """Check cached prefill/decode and graph replay in a fresh engine process."""
-    # Engine initialization requires a fresh CUDA and distributed context.
+    """Check cached prefill/decode and graph replay in a fresh model runner process."""
+    # ModelRunner initialization requires a fresh CUDA and distributed context.
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), policy, str(tmp_path)],
         capture_output=True,
@@ -101,7 +102,7 @@ def _check_ouro_loop_cache(policy: LoopCachePolicy, checkpoint: Path) -> None:
         max_position_embeddings=128,
     )
     config.save_pretrained(checkpoint)
-    engine = Engine(
+    model_runner = ModelRunner(
         EngineConfig(
             model_path=str(checkpoint),
             tp_info=DistributedInfo(0, 1),
@@ -117,23 +118,33 @@ def _check_ouro_loop_cache(policy: LoopCachePolicy, checkpoint: Path) -> None:
     try:
         num_layers = 6 if policy == "depth_indexed" else 2
         expected_indices = list(range(6)) if policy == "depth_indexed" else [0, 1] * 3
-        cache = engine.kv_cache
-        assert engine.model.loop_steps == 3
-        assert engine.model.num_kv_layers == engine.num_kv_layers == cache.num_layers == num_layers
+        cache = model_runner.kv_cache
+        assert model_runner.model.model.loop_steps == 3
+        assert (
+            model_runner.model.model.num_kv_layers
+            == model_runner.num_kv_layers
+            == cache.num_layers
+            == num_layers
+        )
         buffers = [
             buffer for i in range(num_layers) for buffer in (cache.k_cache(i), cache.v_cache(i))
         ]
-        assert torch.count_nonzero(engine.page_table[engine.dummy_req.table_idx]) == 0
+        assert (
+            torch.count_nonzero(model_runner.page_table[model_runner.dummy_req.kv.req_pool_idx])
+            == 0
+        )
         for buffer in buffers:
             assert torch.count_nonzero(buffer[0]) == 0
-        for name, weight in engine.model.state_dict().items():
+        for name, weight in model_runner.model.state_dict().items():
             if "layernorm" in name or name == "model.norm.weight":
                 weight.fill_(1)
             else:
                 weight.mul_(0.05)
         for buffer in buffers:
             buffer.zero_()
-        engine.page_table[0, :8] = torch.arange(1, 9, device=engine.device, dtype=torch.int32)
+        model_runner.page_table[0, :8] = torch.arange(
+            1, 9, device=model_runner.device, dtype=torch.int32
+        )
 
         writes: list[tuple[int, torch.Tensor, torch.Tensor]] = []
         store_kv = cache.store_kv
@@ -149,27 +160,33 @@ def _check_ouro_loop_cache(policy: LoopCachePolicy, checkpoint: Path) -> None:
         for step in range(3):
             cached_len = 0 if step == 0 else len(tokens) - 1
             req = Req(
-                torch.tensor(tokens, dtype=torch.int32), 0, cached_len, 2, 0, SamplingParams(), None
-            )  # type: ignore[arg-type]
-            batch = Batch([req], "prefill" if step == 0 else "decode")
-            batch.padded_reqs = batch.reqs
+                uid=0,
+                origin_input_ids=torch.tensor(tokens, dtype=torch.int32),
+                sampling_params=SamplingParams(max_tokens=2),
+            )
+            req.device_len = len(tokens)
+            req.kv.req_pool_idx = 0
+            req.kv.kv_committed_len = cached_len
+            schedule_batch = ScheduleBatch([req], "prefill" if step == 0 else "decode")
+            schedule_batch.prepare(model_runner.sampler)
+            batch = schedule_batch.get_forward_batch()
+            model_runner.graph_runner.pad_batch(batch)
             batch.input_ids = torch.tensor(
-                tokens[cached_len:], device=engine.device, dtype=torch.int32
+                tokens[cached_len:], device=model_runner.device, dtype=torch.int32
             )
             batch.positions = torch.arange(
-                cached_len, len(tokens), device=engine.device, dtype=torch.int32
+                cached_len, len(tokens), device=model_runner.device, dtype=torch.int32
             )
-            batch.out_loc = engine.page_table[0, cached_len : len(tokens)]
+            batch.out_loc = model_runner.page_table[0, cached_len : len(tokens)]
             if step > 0:
-                batch.padded_reqs = batch.reqs + [engine.dummy_req]
                 for name in ("input_ids", "positions", "out_loc"):
                     value = getattr(batch, name)
                     setattr(batch, name, torch.cat([value, value.new_zeros(1)]))
-            engine.attn_backend.prepare_metadata(batch)
+            model_runner.attn_backend.prepare_metadata(batch)
             before = [buffer.clone() for buffer in buffers]
             writes.clear()
-            with engine.ctx.forward_batch(batch):
-                eager = engine.model.forward().float()[: batch.size].clone()
+            with model_runner.ctx.forward_batch(batch):
+                eager = model_runner.model.forward().float()[: batch.size].clone()
             assert torch.isfinite(eager).all()
             assert [index for index, _, _ in writes] == expected_indices
             # Shared slots retain the last write; depth-indexed slots retain every step.
@@ -191,9 +208,9 @@ def _check_ouro_loop_cache(policy: LoopCachePolicy, checkpoint: Path) -> None:
                 after = [buffer.clone() for buffer in buffers]
                 for buffer, previous in zip(buffers, before):
                     buffer.copy_(previous)
-                engine.attn_backend.prepare_metadata(batch)
-                with engine.ctx.forward_batch(batch):
-                    graphed = engine.graph_runner.replay(batch).clone()
+                model_runner.attn_backend.prepare_metadata(batch)
+                with model_runner.ctx.forward_batch(batch):
+                    graphed = model_runner.graph_runner.replay(batch).clone()
                 torch.testing.assert_close(graphed, eager, rtol=0.02, atol=0.02)
                 assert torch.equal(graphed.argmax(-1), eager.argmax(-1))
                 for buffer, expected in zip(buffers, after):
@@ -202,7 +219,7 @@ def _check_ouro_loop_cache(policy: LoopCachePolicy, checkpoint: Path) -> None:
                 assert torch.count_nonzero(buffer[0]) == 0
             tokens.append(6 + step)
     finally:
-        engine.shutdown()
+        model_runner.shutdown()
 
 
 if __name__ == "__main__":
