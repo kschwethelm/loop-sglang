@@ -26,7 +26,7 @@ class RetractionManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     max_cpu_bytes: int
-    watermark_size: int = 0
+    watermark: float = 0.0
     min_free_slots_delay: int | None = None
     retracted_queue: List[Req] = field(default_factory=list)
     cpu_bytes: int = 0
@@ -100,10 +100,10 @@ class RetractionManager:
             reserved_size = (
                 self.cache_manager.new_pages_required(self.decode_manager.running_reqs) * page_size
             )
-            watermark_size = self.watermark_size if self.table_manager.allocated_size > 0 else 0
-            if not self.cache_manager.restore_fits(req, reserved_size, watermark_size):
+            watermark = self.watermark if self.table_manager.allocated_size > 0 else 0.0
+            if not self.cache_manager.restore_fits(req, reserved_size, watermark):
                 if self.table_manager.allocated_size == 0:
-                    self.cache_manager.check_restore_capacity(req, reserved_size, watermark_size)
+                    self.cache_manager.check_restore_capacity(req, reserved_size, watermark)
                 break
             self.retraction_restore(req)
             resumed.append(req)

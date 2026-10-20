@@ -34,7 +34,7 @@ set_throughput_defaults() {
     esac
     case "$DATASET" in
         sharegpt | alpaca)
-            default_widths="16 32 64 128 256 512"
+            default_widths="8 16 32 64 128 256 512"
             default_decode_width=64
             ;;
         arxiv)
@@ -47,11 +47,15 @@ set_throughput_defaults() {
     if [[ "$CACHE_POLICY" == last_exited ]]; then
         # Last-exited cache requires much more memory than shared KV, making some widths infeasible.
         PAGE_SIZE=1
-        default_cache_tokens=400000 # For last exited: token capacity when every request exits at step 1. Otherwise, token capacity depends on exit distribution.
+        # Full-depth capacities sized to fit alongside model weights and runtime buffers.
+        case "$MODEL" in
+            ouro) default_cache_tokens=100000 ;;
+            huginn) default_cache_tokens=45000 ;;
+        esac
         case "$MODEL:$DATASET" in
-            ouro:sharegpt) default_widths="16 32 64 128" ;;
+            ouro:sharegpt) default_widths="8 16 32 64 128" ;;
             huginn:sharegpt) default_widths="2 4 8 16"; default_decode_width=16 ;;
-            ouro:alpaca) default_widths="16 32 64 128 256 512" ;;
+            ouro:alpaca) default_widths="8 16 32 64 128 256 512" ;;
             huginn:alpaca) default_widths="16 32 64 128 256" ;;
             ouro:arxiv) default_widths="2 4 8" ;;
             huginn:arxiv) default_widths="1"; default_decode_width=1 ;;
@@ -59,10 +63,11 @@ set_throughput_defaults() {
     fi
     WIDTHS="${WIDTHS:-$default_widths}"
     DECODE_WIDTH="${DECODE_WIDTH:-$default_decode_width}"
+    # Token capacity assumes full depth; auto uses memory-based sizing.
     CACHE_TOKENS="${CACHE_TOKENS:-$default_cache_tokens}"
-    NUM_PAGES_ARGS=()
+    KV_CACHE_ARGS=()
     if [[ "$CACHE_TOKENS" != auto ]]; then
-        NUM_PAGES_ARGS=(--num-pages "$((CACHE_TOKENS / PAGE_SIZE))")
+        KV_CACHE_ARGS=(--max-total-tokens "$CACHE_TOKENS")
     fi
 }
 

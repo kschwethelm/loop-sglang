@@ -14,7 +14,7 @@ from loopsgl.layers import set_rope_device
 from loopsgl.models import create_model, load_weight
 from loopsgl.models.looped.base import BaseLoopedModel
 from loopsgl.moe import create_moe_backend
-from loopsgl.utils import div_even, init_logger, profile_range, torch_dtype
+from loopsgl.utils import div_ceil, div_even, init_logger, profile_range, torch_dtype
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -193,6 +193,7 @@ class ModelRunner:
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[0]
+        full_depth_layers = self.num_kv_layers
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
@@ -205,22 +206,32 @@ class ModelRunner:
             assert isinstance(self.model.model, BaseLoopedModel)
             from loopsgl.kvcache.last_exited import LastExitedKVCache
 
+            full_depth_layers += self.model.model.num_core_layers * (
+                self.model.model.loop_steps - 1
+            )
             cache_per_page = LastExitedKVCache.memory_per_page(
                 self.num_kv_layers,
                 self.model.model.num_core_layers,
                 self.model.model.loop_steps,
                 cache_per_page // (2 * self.num_kv_layers),
             )
-        num_pages = config.num_page_override
-        if num_pages is None:
+        if config.max_total_tokens is None:
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
             num_pages = available_memory // cache_per_page - 1  # reserve padding page 0
+        elif config.loop_cache_policy == "last_exited":
+            # Nominal pages also provide the handles used by tokens that exit early.
+            num_pages = div_ceil(config.max_total_tokens * full_depth_layers, self.num_kv_layers)
+        else:
+            num_pages = config.max_total_tokens // config.page_size
 
-        assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
-        num_tokens = num_pages * config.page_size
+        assert num_pages > 0, "Not enough memory for KV cache, try increasing --memory-ratio"
+        num_tokens = num_pages * config.page_size * self.num_kv_layers // full_depth_layers
         real_kv_size = (num_pages + 1) * cache_per_page
-        logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")
+        logger.info(
+            f"Allocating {num_tokens} tokens for KV cache (full-depth capacity), "
+            f"K + V = {mem_GB(real_kv_size)}"
+        )
         return num_pages
 
     def _sync_get_memory(self) -> Tuple[int, int]:

@@ -111,7 +111,7 @@ for width in $WIDTHS; do
                     --max-running-requests "$width"
                     --dtype "$DTYPE"
                     --attention-backend "$ATTENTION_BACKEND"
-                    "${NUM_PAGES_ARGS[@]}"
+                    "${KV_CACHE_ARGS[@]}"
                     --memory-ratio "$MEMORY_RATIO"
                     --max-prefill-length "$MAX_PREFILL_LENGTH"
                     --page-size "$PAGE_SIZE"

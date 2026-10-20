@@ -110,7 +110,7 @@ def _check_ouro_loop_cache(policy: LoopCachePolicy, checkpoint: Path) -> None:
             use_dummy_weight=True,
             use_pynccl=False,
             max_running_req=1,
-            num_page_override=16,
+            max_total_tokens=16,
             cuda_graph_bs=[2],
             loop_cache_policy=policy,
         )

@@ -165,7 +165,7 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> None:
         "--watermark",
         type=float,
         default=ServerArgs.watermark,
-        help="Fraction of KV cache pages to keep available when admitting new requests.",
+        help="Fraction of physical KV cache capacity to keep available when admitting new requests.",
     )
 
     parser.add_argument(
@@ -194,7 +194,8 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> None:
         "--memory-ratio",
         type=float,
         default=ServerArgs.memory_ratio,
-        help="The fraction of GPU memory to use for KV cache.",
+        help="Fraction of initially free GPU memory to budget for model weights, runtime buffers, "
+        "and KV cache. Remaining initialization allocations and decode graphs need extra headroom.",
     )
 
     assert ServerArgs.use_dummy_weight == False
@@ -274,11 +275,11 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
-        "--num-pages",
-        dest="num_page_override",
+        "--max-total-tokens",
         type=int,
-        default=ServerArgs.num_page_override,
-        help="Set the maximum number of pages for KVCache.",
+        default=ServerArgs.max_total_tokens,
+        help="KV cache token capacity. For last-exited KV, capacity assumes full depth; "
+        "early exits allow more tokens to fit. Defaults to automatic memory-based sizing.",
     )
 
     parser.add_argument(

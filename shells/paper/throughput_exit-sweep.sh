@@ -78,7 +78,7 @@ for backend in $BACKENDS; do
             --min-free-slots-delay "${MIN_FREE_SLOTS_DELAY:-$((DECODE_WIDTH / 8 > 0 ? DECODE_WIDTH / 8 : 1))}"
             --dtype "$DTYPE"
             --attention-backend "$ATTENTION_BACKEND"
-            "${NUM_PAGES_ARGS[@]}"
+            "${KV_CACHE_ARGS[@]}"
             --memory-ratio "$MEMORY_RATIO"
             --max-prefill-length "$MAX_PREFILL_LENGTH"
             --page-size "$PAGE_SIZE"

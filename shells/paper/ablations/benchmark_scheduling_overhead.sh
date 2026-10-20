@@ -60,7 +60,7 @@ for variant in sync async lookahead; do
         --max-seq-len-override "$MAX_MODEL_LEN" --max-running-requests 64 \
         --min-coda-batch-size 1 --min-free-slots-delay 8 \
         --dtype "$DTYPE" --attention-backend "$ATTENTION_BACKEND" \
-        "${NUM_PAGES_ARGS[@]}" --memory-ratio "$MEMORY_RATIO" \
+        "${KV_CACHE_ARGS[@]}" --memory-ratio "$MEMORY_RATIO" \
         --page-size "$PAGE_SIZE" --max-prefill-length "$MAX_PREFILL_LENGTH" \
         "${RADIX_CACHE_ARGS[@]}" --watermark "$WATERMARK" --retraction-mode "$RETRACTION_MODE" \
         --cuda-graph-max-bs 64 --cuda-graph-backend-prefill breakable \
