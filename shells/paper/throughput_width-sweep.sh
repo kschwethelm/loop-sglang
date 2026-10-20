@@ -80,7 +80,7 @@ for repeat in $(seq 0 $((REPEATS - 1))); do
                 --min-free-slots-delay "${MIN_FREE_SLOTS_DELAY:-$((width / 8 > 0 ? width / 8 : 1))}"
                 --dtype "$DTYPE"
                 --attention-backend "$ATTENTION_BACKEND"
-                "${NUM_PAGES_ARGS[@]}"
+                "${KV_CACHE_ARGS[@]}"
                 --memory-ratio "$MEMORY_RATIO"
                 --max-prefill-length "$MAX_PREFILL_LENGTH"
                 --page-size "$PAGE_SIZE"

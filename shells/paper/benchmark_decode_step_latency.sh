@@ -35,7 +35,7 @@ mkdir -p -- "$(dirname -- "$OUTPUT_PATH")"
 read -r -a BATCH_SIZE_ARGS <<< "$BATCH_SIZES"
 KV_CACHE_ARGS=(--memory-ratio "${MEMORY_RATIO:-0.9}")
 if [[ -n "$cache_tokens" ]]; then
-    KV_CACHE_ARGS=(--num-pages "$((cache_tokens / PAGE_SIZE))")
+    KV_CACHE_ARGS=(--max-total-tokens "$cache_tokens")
 fi
 
 for context_length in $CONTEXT_LENGTHS; do

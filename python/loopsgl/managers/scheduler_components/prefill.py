@@ -23,7 +23,7 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
-    watermark_size: int
+    watermark: float
     has_running_reqs: bool
     reserve_decode: bool = False
 
@@ -46,10 +46,12 @@ class PrefillAdder:
         cached_len = handle.cached_len
         page_size = self.cache_manager.page_size
         needed_pages = div_ceil(req.input_len, page_size) - div_ceil(cached_len, page_size)
-        watermark_size = self.watermark_size if self.has_running_reqs else 0
+        watermark = self.watermark if self.has_running_reqs else 0.0
         decode_size = self._decode_headroom(req) if self.has_running_reqs else 0
-        required_size = needed_pages * page_size + self.reserved_size + watermark_size + decode_size
-        if self.has_running_reqs and required_size > self.cache_manager.available_size:
+        required_size = needed_pages * page_size + self.reserved_size + decode_size
+        if self.has_running_reqs and required_size > self.cache_manager.get_available_size(
+            watermark
+        ):
             return None
         self.cache_manager.lock(handle)
         if not self.has_running_reqs:
@@ -58,7 +60,7 @@ class PrefillAdder:
             except RuntimeError:
                 self.cache_manager.unlock(handle)
                 raise
-        if required_size > self.cache_manager.available_size:
+        if required_size > self.cache_manager.get_available_size(watermark):
             return self.cache_manager.unlock(handle)
 
         table_idx = self.table_manager.allocate()
@@ -167,8 +169,7 @@ class PrefillManager:
             reserved_size=reserved_size,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
-            watermark_size=int(self.watermark * self.cache_manager.num_pages)
-            * self.cache_manager.page_size,
+            watermark=self.watermark,
             has_running_reqs=self.table_manager.allocated_size > 0,
             reserve_decode=self.reserve_decode,
         )

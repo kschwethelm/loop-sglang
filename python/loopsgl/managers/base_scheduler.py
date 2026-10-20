@@ -99,7 +99,7 @@ class BaseScheduler(SchedulerIOMixin, ABC):
             table_manager=self.table_manager,
             decode_manager=self.decode_manager,
             max_cpu_bytes=int(config.retraction_cpu_memory_gb * 1024**3),
-            watermark_size=int(config.watermark * self.model_runner.num_pages) * config.page_size,
+            watermark=config.watermark,
             min_free_slots_delay=config.min_free_slots_delay,
         )
         # some alias for easy access

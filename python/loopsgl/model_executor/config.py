@@ -39,12 +39,14 @@ class EngineConfig:
     loop_params: LoopParams = field(default_factory=LoopParams)
     json_model_override_args: str = "{}"
     loop_cache_policy: Literal["depth_indexed", "shared", "last_exited"] | None = None
-    num_page_override: int | None = None  # if not None, will override the number of pages
+    max_total_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.loop_cache_policy is None:
             object.__setattr__(self, "loop_cache_policy", "depth_indexed")
         _ = self.model_override_args
+        if self.max_total_tokens is not None and self.max_total_tokens < self.page_size:
+            raise ValueError("max_total_tokens must be at least page_size.")
         if self.cuda_graph_backend_prefill not in {"breakable", "disabled"}:
             raise ValueError("cuda_graph_backend_prefill must be 'breakable' or 'disabled'.")
         if self.cuda_graph_max_bs_prefill is not None and self.cuda_graph_max_bs_prefill < 1:

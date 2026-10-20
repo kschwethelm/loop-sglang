@@ -43,12 +43,24 @@ class CacheManager:
 
     @property
     def available_size(self) -> int:
+        return self.get_available_size()
+
+    def _watermark_size(self, watermark: float) -> int:
+        """Count reserved physical slots, or tokens for a fixed-layout KV pool."""
+        if self.version_pool is not None:
+            return int(watermark * (self.version_pool.num_kv_slots - 1))
+        return int(watermark * self.num_pages) * self.page_size
+
+    def get_available_size(self, watermark: float = 0.0) -> int:
+        """Count full-depth token capacity after reserving physical KV headroom."""
         logical = self.prefix_cache.size_info.evictable_size + len(self.free_slots) * self.page_size
+        watermark_size = self._watermark_size(watermark)
         if self.version_pool is None:
-            return logical
+            return logical - watermark_size
         return min(
             logical,
-            self.version_pool.available_slots // self.version_pool.slots_per_token
+            (self.version_pool.available_slots - watermark_size)
+            // self.version_pool.slots_per_token
             + self.prefix_cache.size_info.evictable_size,
         )
 
@@ -235,27 +247,29 @@ class CacheManager:
         for req, depth in early:
             req.kv.reclaimed_versions += pool.loop_steps - depth
 
-    def restore_fits(self, req: Req, reserved_size: int, watermark_size: int) -> bool:
+    def restore_fits(self, req: Req, reserved_size: int, watermark: float) -> bool:
         """Check independent logical and physical budgets without token rounding."""
         evictable = self.prefix_cache.size_info.evictable_size
         logical_available = len(self.free_slots) * self.page_size + evictable
         logical_needed = div_ceil(req.device_len, self.page_size) * self.page_size
-        if logical_needed + reserved_size + watermark_size > logical_available:
-            return False
+        watermark_size = self._watermark_size(watermark)
         pool = self.version_pool
         if pool is None:
-            return True
+            return logical_needed + reserved_size + watermark_size <= logical_available
+        if logical_needed + reserved_size > logical_available:
+            return False
         backup = req.kv.retraction_backup
         assert backup is not None
         slots = pool.restore_slots(backup.cpu_tensors, backup.cached_len)
-        physical_needed = slots + pool.slots_per_token * (1 + reserved_size + watermark_size)
+        physical_needed = slots + pool.slots_per_token * (1 + reserved_size) + watermark_size
         physical_available = pool.available_slots + pool.slots_per_token * evictable
         return physical_needed <= physical_available
 
-    def check_restore_capacity(self, req: Req, reserved_size: int, watermark_size: int) -> None:
+    def check_restore_capacity(self, req: Req, reserved_size: int, watermark: float) -> None:
         """Reject an unrestorable snapshot when no running request can free space."""
-        if self.restore_fits(req, reserved_size, watermark_size):
+        if self.restore_fits(req, reserved_size, watermark):
             return
+        watermark_size = self._watermark_size(watermark)
         pool = self.version_pool
         if pool is None:
             needed_pages = div_ceil(req.device_len + reserved_size + watermark_size, self.page_size)
@@ -265,9 +279,9 @@ class CacheManager:
         assert backup is not None
         slots = pool.restore_slots(backup.cpu_tensors, backup.cached_len)
         evictable = self.prefix_cache.size_info.evictable_size
-        physical_needed = slots + pool.slots_per_token * (1 + reserved_size + watermark_size)
+        physical_needed = slots + pool.slots_per_token * (1 + reserved_size) + watermark_size
         physical_available = pool.available_slots + pool.slots_per_token * evictable
-        logical_needed = req.device_len + reserved_size + watermark_size
+        logical_needed = req.device_len + reserved_size
         logical_available = len(self.free_slots) + evictable
         raise RuntimeError(
             f"KV cache exhausted restoring request {req.uid}: "

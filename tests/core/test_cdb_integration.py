@@ -131,7 +131,9 @@ def _gpu_worker(
         return weights
 
     ModelRunner._load_weight_state_dict = stable_weights
-    pages = (30 if policy == "shared" else 120) if mode == "pressure" else 512
+    max_total_tokens = 30 if mode == "pressure" else 512
+    if policy == "last_exited" and mode != "pressure":
+        max_total_tokens //= 4
     config = SchedulerConfig(
         model_path=checkpoint,
         tp_info=DistributedInfo(rank, tp_size),
@@ -143,7 +145,7 @@ def _gpu_worker(
         max_running_req=4,
         max_extend_tokens=32,
         max_seq_len_override=128,
-        num_page_override=pages,
+        max_total_tokens=max_total_tokens,
         attention_backend="fa",
         cuda_graph_bs=[1, 2, 4],
         cuda_graph_max_bs=4,
