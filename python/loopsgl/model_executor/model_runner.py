@@ -11,6 +11,7 @@ from loopsgl.core import Context, ForwardBatch, Req, SamplingParams, set_global_
 from loopsgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from loopsgl.kvcache import create_kvcache_pool
 from loopsgl.layers import set_rope_device
+from loopsgl.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from loopsgl.models import create_model, load_weight
 from loopsgl.models.looped.base import BaseLoopedModel
 from loopsgl.moe import create_moe_backend
@@ -28,6 +29,7 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    logits_output: LogitsProcessorOutput | None = None
 
 
 class ModelRunner:
@@ -63,10 +65,10 @@ class ModelRunner:
             self.model.model.loop_cache_policy = config.loop_cache_policy
             self.num_kv_layers = self.model.model.num_kv_layers
             logger.info_rank0(f"Loop steps: {self.model.model.loop_steps}")
-        if config.loop_cache_policy == "last_exited" and not isinstance(
-            self.model.model, BaseLoopedModel
-        ):
-            raise ValueError("Last-exited KV requires a looped model")
+        elif config.loop_cache_policy != "depth_indexed":
+            raise ValueError(
+                f"KV cache policy {config.loop_cache_policy!r} requires a looped model"
+            )
         self.model.load_state_dict(self._load_weight_state_dict(config))
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
@@ -125,7 +127,7 @@ class ModelRunner:
         self.dummy_req = Req(
             uid=-1,
             origin_input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
-            sampling_params=SamplingParams(max_tokens=1),
+            sampling_params=SamplingParams(max_new_tokens=1),
         )
         self.dummy_req.device_len = 1
         self.dummy_req.kv.req_pool_idx = config.max_running_req
@@ -258,12 +260,40 @@ class ModelRunner:
     def forward_batch(self, batch: ForwardBatch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         with profile_range("cb.compute.prefill" if batch.is_prefill else "cb.compute.decode"):
-            logits = self._forward_logits(batch)
-            next_tokens_gpu = self._sample_logits(logits[: batch.size], args)
+            if args.needs_logprobs_or_trace:
+                logits, scores = self._forward_with_logprobs(batch, args)
+                next_tokens_gpu = self._sample_with_trace(logits[: batch.size], args)
+                scores = self.sampler.compute_logprobs(
+                    logits[: batch.size], next_tokens_gpu, args, scores
+                )
+            else:
+                logits = self._forward_logits(batch)
+                next_tokens_gpu = self._sample_logits(logits[: batch.size], args)
+                scores = None
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            host_scores = scores.copy_to_cpu() if scores is not None else None
             copy_done_event = torch.cuda.Event()
             copy_done_event.record(self.stream)
-            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, host_scores)
+
+    def _forward_with_logprobs(
+        self, batch: ForwardBatch, args: BatchSamplingArgs
+    ) -> tuple[torch.Tensor, LogitsProcessorOutput | None]:
+        metadata = args.logits_metadata
+        if batch.is_prefill and metadata is not None and metadata.has_input_logprobs:
+            if self.prefill_graph_runner.bucket_for(batch) is not None:
+                output = self.prefill_graph_runner.replay(
+                    batch, self.attn_backend, logits_metadata=metadata
+                )
+            else:
+                with self.ctx.forward_batch(batch):
+                    self.attn_backend.prepare_metadata(batch)
+                    batch.record_metadata_ready()
+                    hidden = self.model.model.forward(batch.input_ids)
+                    output = LogitsProcessor().forward(hidden, self.model.lm_head, batch, metadata)
+            assert output.next_token_logits is not None
+            return output.next_token_logits, output
+        return self._forward_logits(batch), None
 
     def _forward_logits(self, batch: ForwardBatch) -> torch.Tensor:
         """Share prefill execution between ordinary and depth-adaptive serving."""
@@ -278,6 +308,12 @@ class ModelRunner:
 
     def _sample_logits(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         return self.sampler.sample(logits, args).to(torch.int32)
+
+    def _sample_with_trace(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
+        tokens = self._sample_logits(logits, args)
+        if args.forced_token_ids is not None:
+            tokens = torch.where(args.forced_token_ids >= 0, args.forced_token_ids, tokens)
+        return tokens
 
     def shutdown(self) -> None:
         self.prefill_graph_runner.destroy()

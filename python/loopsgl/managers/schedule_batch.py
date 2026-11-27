@@ -14,24 +14,8 @@ from loopsgl.core import ForwardBatch, Req
 from loopsgl.model_executor.sample import BatchSamplingArgs, make_device_tensor
 
 if TYPE_CHECKING:
+    from loopsgl.managers.scheduler_components.metrics_reporter import PrefillStats
     from loopsgl.model_executor.sample import Sampler
-
-
-@dataclass
-class BatchSizeStats:
-    """Count actual and padded input tokens over executed forwards."""
-
-    num_batches: int = 0
-    num_tokens: int = 0
-    num_padded_tokens: int = 0
-
-    def record(self, batch: ForwardBatch, *, padded_tokens: int | None = None) -> None:
-        tokens = sum(batch.extend_lens_cpu) if batch.is_prefill else batch.size
-        if padded_tokens is None:
-            padded_tokens = tokens if batch.is_prefill else batch.padded_size
-        self.num_batches += 1
-        self.num_tokens += tokens
-        self.num_padded_tokens += padded_tokens
 
 
 @dataclass
@@ -40,6 +24,7 @@ class ScheduleBatch:
 
     reqs: List[Req]
     phase: Literal["prefill", "decode"]
+    prefill_stats: PrefillStats | None = None
     req_pool_indices: torch.Tensor = field(init=False)
     seq_lens: torch.Tensor = field(init=False)
     extend_lens: torch.Tensor = field(init=False)
@@ -93,6 +78,7 @@ class ScheduleBatch:
             all(req.sampling_params.is_greedy for req in self.reqs),
             need_top_k=any(1 <= req.sampling_params.top_k != self.vocab_size for req in self.reqs),
             need_top_p=any(req.sampling_params.top_p < 1.0 for req in self.reqs),
+            cpu_indices=keep_indices,
         )
 
     def merge_batch(self, other: ScheduleBatch, vocab_size: int) -> None:

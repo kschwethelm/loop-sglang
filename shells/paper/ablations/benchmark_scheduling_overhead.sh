@@ -20,7 +20,8 @@ if [[ "$CACHE_POLICY" == depth_indexed ]]; then
     exit 1
 fi
 MODEL_ID="$OURO_1_4B_MODEL_ID"
-WORKLOAD="$(replay_workload_for ouro sharegpt 0.2)"
+THRESHOLD=0.0001
+WORKLOAD="$(replay_workload_for ouro sharegpt "$THRESHOLD")"
 NUM_REQUESTS="$(num_requests_for "$DATASET")"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/ablations/scheduling-overhead}"
 mkdir -p "$OUTPUT_DIR"
@@ -46,7 +47,7 @@ for variant in sync async lookahead; do
             exit 1
         fi
     done
-    echo "Profiling $variant: graphs=all, predicted retirement, W=64, K=1, q=0.2"
+    echo "Profiling $variant: graphs=all, predicted retirement, W=64, K=1, q=$THRESHOLD"
     "$NSYS_BIN" profile \
         --trace=cuda,nvtx --sample=none --cpuctxsw=none \
         --cuda-graph-trace=graph --cuda-event-trace=false \
@@ -56,12 +57,13 @@ for variant in sync async lookahead; do
         --scheduler cdb --refill --model-path "$MODEL_ID" \
         --dataset-name custom --dataset-path "$WORKLOAD" \
         --custom-input-format token-ids --no-shuffle --replay-exits \
-        --exit-threshold 0.2 --loop-steps 4 --loop-cache-policy "$CACHE_POLICY" \
+        --exit-threshold "$THRESHOLD" --loop-steps 4 --loop-cache-policy "$CACHE_POLICY" \
         --max-seq-len-override "$MAX_MODEL_LEN" --max-running-requests 64 \
         --min-coda-batch-size 1 --min-free-slots-delay 8 \
         --dtype "$DTYPE" --attention-backend "$ATTENTION_BACKEND" \
         "${KV_CACHE_ARGS[@]}" --memory-ratio "$MEMORY_RATIO" \
-        --page-size "$PAGE_SIZE" --max-prefill-length "$MAX_PREFILL_LENGTH" \
+        --page-size "$PAGE_SIZE" --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
+        --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \
         "${RADIX_CACHE_ARGS[@]}" --watermark "$WATERMARK" --retraction-mode "$RETRACTION_MODE" \
         --cuda-graph-max-bs 64 --cuda-graph-backend-prefill breakable \
         --num-prompts "$NUM_REQUESTS" \

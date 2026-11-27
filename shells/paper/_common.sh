@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly OURO_1_4B_MODEL_ID="KristianS7/Ouro-1.4B"
+readonly OURO_1_4B_MODEL_ID="${OURO_1_4B_MODEL_ID:-KristianS7/Ouro-1.4B}"
 readonly OURO_2_6B_MODEL_ID="KristianS7/Ouro-2.6B"
 readonly HUGINN_MODEL_ID="KristianS7/huginn-0125"
 
@@ -12,7 +12,9 @@ DTYPE="${DTYPE:-bfloat16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-fa}"
 PAGE_SIZE="${PAGE_SIZE:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
-MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-8192}"
+HUGINN_MODEL_OVERRIDE_ARGS="{\"max_position_embeddings\":$MAX_MODEL_LEN,\"state_init\":\"zero\"}"
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-8192}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-$MAX_PREFILL_TOKENS}"
 MEMORY_RATIO="${MEMORY_RATIO:-0.9}"
 WATERMARK="${WATERMARK:-0.0}"
 RETRACTION_MODE="${RETRACTION_MODE:-none}"
@@ -38,7 +40,7 @@ set_throughput_defaults() {
             default_decode_width=64
             ;;
         arxiv)
-            default_widths="2 4 8 16 32 64"
+            default_widths="2 4 8 16 32"
             default_decode_width=8
             ;;
         *) echo "unknown dataset '$DATASET' (expected: sharegpt, alpaca, arxiv)" >&2; return 1 ;;
@@ -54,11 +56,11 @@ set_throughput_defaults() {
         esac
         case "$MODEL:$DATASET" in
             ouro:sharegpt) default_widths="8 16 32 64 128" ;;
-            huginn:sharegpt) default_widths="2 4 8 16"; default_decode_width=16 ;;
+            huginn:sharegpt) default_widths="8 16"; default_decode_width=16 ;;
             ouro:alpaca) default_widths="8 16 32 64 128 256 512" ;;
-            huginn:alpaca) default_widths="16 32 64 128 256" ;;
+            huginn:alpaca) default_widths="8 16 32 64 128 256" ;;
             ouro:arxiv) default_widths="2 4 8" ;;
-            huginn:arxiv) default_widths="1"; default_decode_width=1 ;;
+            huginn:arxiv) default_widths=""; default_decode_width=1 ;;
         esac
     fi
     WIDTHS="${WIDTHS:-$default_widths}"
@@ -84,26 +86,56 @@ num_requests_for() {
     esac
 }
 
-# Converted bundles retain the research filenames and full recurrent budgets.
-workload_for() {
-    local depth suffix
+# Each replay json file contains the tokens and their exit depths for one threshold.
+# Exits are recorded by shells/paper/workloads/record_workload.sh.
+replay_workload_for() {
+    local recording
     case "$1" in
-        ouro)   depth=4 ;;
-        huginn) depth=16 ;;
+        ouro)   recording=last_exited_early_exit_lookahead ;; # last-exited KV + lookahead
+        huginn) recording=shared_convergence_lookahead ;; # shared KV + lookahead
         *) echo "unknown model '$1' (expected: ouro, huginn)" >&2; return 1 ;;
     esac
     case "$2" in
-        sharegpt) suffix=_10k ;;
-        alpaca)   suffix="" ;;
-        arxiv)    suffix=_6k ;;
+        sharegpt | alpaca | arxiv) ;;
         *) echo "unknown dataset '$2' (expected: sharegpt, alpaca, arxiv)" >&2; return 1 ;;
     esac
-    echo "outputs/workloads/${1}_${2}_recur${depth}${suffix}.jsonl"
+    echo "outputs/workloads/$2/$1/${recording}_q$3.jsonl"
 }
 
-# Each replay json file contains the final exit depths for one threshold.
-replay_workload_for() {
-    local workload
-    workload="$(workload_for "$1" "$2")"
-    echo "${workload%.jsonl}.q${3}.jsonl"
+wait_for_server() {
+    local server_pid="$1" base_url="$2" timeout="${3:-600}"
+    uv run --frozen --project "$REPO_ROOT" python - "$server_pid" "$base_url" "$timeout" <<'READY'
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+pid, base_url, timeout = int(sys.argv[1]), sys.argv[2].rstrip("/"), float(sys.argv[3])
+deadline = time.monotonic() + timeout
+while time.monotonic() < deadline:
+    os.kill(pid, 0)
+    try:
+        with urllib.request.urlopen(base_url + "/health", timeout=1) as response:
+            if response.status == 200:
+                break
+    except (urllib.error.URLError, TimeoutError):
+        pass
+    time.sleep(0.2)
+else:
+    raise TimeoutError(f"Server was not ready after {timeout} seconds: {base_url}")
+READY
+}
+
+# Use a custom log directory
+log_experiment() {
+    local output_path="$1" run_name="$2"
+    shift 2
+    local log_dir log_name run_id
+    log_dir="$(dirname -- "$output_path")/logs"
+    run_id="${SLURM_JOB_ID:-$(date -u +%Y%m%dT%H%M%SZ)_$$}"
+    log_name="$(basename -- "${output_path%.jsonl}")_${run_name}_$run_id"
+    mkdir -p -- "$log_dir"
+    echo "Logs: $log_dir/$log_name.out and $log_dir/$log_name.err"
+    "$@" >"$log_dir/$log_name.out" 2>"$log_dir/$log_name.err"
 }

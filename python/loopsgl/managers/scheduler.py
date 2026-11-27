@@ -152,13 +152,8 @@ class Scheduler(BaseScheduler):
             if batch.is_prefill
             else 0
         )
-        forward_output = self.model_runner.forward_batch(batch, forward_input.sample_args)
-        if batch.is_prefill:
-            self.batch_size_stats["prefill"].record(
-                batch, padded_tokens=self.model_runner.prefill_graph_runner.bucket_for(batch)
-            )
-        else:
-            self.batch_size_stats["decode"].record(batch)
+        with self.cuda_event_timer.measure("prefill" if batch.is_prefill else "decode"):
+            forward_output = self.model_runner.forward_batch(batch, forward_input.sample_args)
         self.metadata_ready = batch.metadata_ready
         for req, is_middle_chunk in zip(forward_input.reqs, forward_input.is_middle_chunks):
             req.complete_one(is_middle_chunk=is_middle_chunk)

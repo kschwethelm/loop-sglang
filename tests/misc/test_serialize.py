@@ -30,7 +30,7 @@ def test_serialize_deserialize() -> None:
     assert (y.z[0].x, y.z[0].y, y.z[0].z) == (20, "world", [])
     torch.testing.assert_close(y.z[0].w, t)
 
-    params = SamplingParams(temperature=0.7, max_tokens=17, ignore_eos=True)
+    params = SamplingParams(temperature=0.7, max_new_tokens=17, ignore_eos=True)
     u = BatchTokenizedGenerateReqInput(
         [TokenizedGenerateReqInput(uid=42, input_ids=t, sampling_params=params)]
     )

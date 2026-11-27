@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Tuple
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -30,6 +31,7 @@ def ref_indexing(
 
 
 @call_if_main(__name__)
+@pytest.mark.cuda
 def test_indexing():
     EMBED_SIZE = 4096
     NUM_TOKENS = 131072
@@ -62,6 +64,7 @@ def test_indexing():
 
 
 @call_if_main(__name__)
+@pytest.mark.cuda
 def test_indexing_with_mask():
     EMBED_SIZE = 4096
     NUM_TOKENS = 131072

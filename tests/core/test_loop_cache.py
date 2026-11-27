@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -67,10 +66,7 @@ def test_loop_cache_layout(
     assert ouro.core_cache_layer_index(23, 3) == ouro_kv_layers - 1
 
 
-@pytest.mark.skipif(
-    not os.environ.get("SLURM_JOB_ID") or not torch.cuda.is_available(),
-    reason="Ouro integration check requires CUDA in a SLURM allocation",
-)
+@pytest.mark.cuda
 @pytest.mark.parametrize("policy", ["depth_indexed", "shared"])
 def test_ouro_loop_cache(policy: LoopCachePolicy, tmp_path: Path) -> None:
     """Check cached prefill/decode and graph replay in a fresh model runner process."""
@@ -86,7 +82,6 @@ def test_ouro_loop_cache(policy: LoopCachePolicy, tmp_path: Path) -> None:
 
 @torch.inference_mode()
 def _check_ouro_loop_cache(policy: LoopCachePolicy, checkpoint: Path) -> None:
-    assert os.environ.get("SLURM_JOB_ID"), "GPU checks require a SLURM allocation"
     config = OuroConfig(
         total_ut_steps=3,
         architectures=["OuroForCausalLM"],
@@ -162,7 +157,7 @@ def _check_ouro_loop_cache(policy: LoopCachePolicy, checkpoint: Path) -> None:
             req = Req(
                 uid=0,
                 origin_input_ids=torch.tensor(tokens, dtype=torch.int32),
-                sampling_params=SamplingParams(max_tokens=2),
+                sampling_params=SamplingParams(max_new_tokens=2),
             )
             req.device_len = len(tokens)
             req.kv.req_pool_idx = 0

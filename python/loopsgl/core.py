@@ -35,12 +35,13 @@ class SamplingParams:
     top_k: int = -1
     top_p: float = 1.0
     ignore_eos: bool = False
-    max_tokens: int = 1024
+    max_new_tokens: int = 1024
     stop: str | List[str] | None = None
     no_stop_trim: bool = False
     skip_special_tokens: bool = False
     replay_exit_depths: List[int] | None = None  # predetermined exit depths for reproducibility
     return_loop_steps: bool = False
+    trace_decode_token_ids: List[int] | None = None
 
     def __post_init__(self) -> None:
         self.normalize()
@@ -53,6 +54,14 @@ class SamplingParams:
 
     def verify(self) -> None:
         """Reject unsupported sampling values before dispatching model work."""
+        trace = self.trace_decode_token_ids
+        if trace is not None:
+            if not isinstance(trace, list) or not trace:
+                raise ValueError("trace_decode_token_ids must be a nonempty list of token IDs.")
+            if len(trace) != self.max_new_tokens:
+                raise ValueError("Forced-token trace must match max_new_tokens exactly.")
+            if not self.ignore_eos or self.stop:
+                raise ValueError("Forced decoding requires ignore_eos=True and no string stops.")
         if (
             isinstance(self.temperature, bool)
             or not isinstance(self.temperature, (int, float))
@@ -74,11 +83,11 @@ class SamplingParams:
         ):
             raise ValueError("top_k must be -1 (disable) or a positive integer.")
         if (
-            isinstance(self.max_tokens, bool)
-            or not isinstance(self.max_tokens, int)
-            or self.max_tokens < 1
+            isinstance(self.max_new_tokens, bool)
+            or not isinstance(self.max_new_tokens, int)
+            or self.max_new_tokens < 1
         ):
-            raise ValueError("max_tokens must be a positive integer.")
+            raise ValueError("max_new_tokens must be a positive integer.")
 
     @property
     def is_greedy(self) -> bool:
@@ -118,6 +127,9 @@ class Req:
     sampling_params: SamplingParams
     output_ids: List[int] = field(default_factory=list)
     kv: ReqKvInfo = field(default_factory=ReqKvInfo)
+    return_logprob: bool = False
+    logprob_start_len: int = -1
+    top_logprobs_num: int = 0
     fill_ids: torch.Tensor = field(init=False)
     device_len: int = field(default=0, init=False)
     inflight_middle_chunks: int = field(default=0, init=False)
@@ -148,7 +160,7 @@ class Req:
 
     @property
     def max_device_len(self) -> int:
-        return self.origin_input_len + self.sampling_params.max_tokens
+        return self.origin_input_len + self.sampling_params.max_new_tokens
 
     @property
     def output_len(self) -> int:

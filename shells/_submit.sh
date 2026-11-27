@@ -133,7 +133,7 @@ if [[ -n "${CUDA_ENV_SCRIPT:-}" ]]; then
 fi
 export PATH="$PATH:$HOME/.local/bin"
 
-if [[ -n "${PIN_H100_UUID:-}" ]]; then
+if [[ -n "${PIN_GPU_UUID:-}" ]]; then
     if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
         echo "ERROR: GPU pinning requires SLURM to set CUDA_VISIBLE_DEVICES." >&2
         exit 1
@@ -148,10 +148,10 @@ visible = {
     "GPU-" + str(torch.cuda.get_device_properties(index).uuid).removeprefix("GPU-")
     for index in range(torch.cuda.device_count())
 }
-if os.environ["PIN_H100_UUID"] not in visible:
+if os.environ["PIN_GPU_UUID"] not in visible:
     raise SystemExit("ERROR: The pinned GPU is not in this job's visible allocation.")
 PYTHON
-    export CUDA_VISIBLE_DEVICES="$PIN_H100_UUID"
+    export CUDA_VISIBLE_DEVICES="$PIN_GPU_UUID"
 fi
 BATCH
 

@@ -35,6 +35,9 @@ class GenerateReqInput:
     sampling_params: SamplingParams
     input_ids: list[int] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    return_logprob: bool = False
+    logprob_start_len: int = -1
+    top_logprobs_num: int = 0
 
 
 @dataclass
@@ -44,6 +47,9 @@ class TokenizedGenerateReqInput(BaseReq):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
+    return_logprob: bool = False
+    logprob_start_len: int = -1
+    top_logprobs_num: int = 0
 
 
 @dataclass
@@ -101,6 +107,20 @@ class SchedulerControlOutput(BaseReq):
     error: str | None = None
 
 
+@dataclass(kw_only=True)
+class LogprobOutput:
+    """Carry compact per-request score updates independently of displayed text."""
+
+    input_token_logprobs_val: list[float | None] | None = None
+    input_token_logprobs_idx: list[int] | None = None
+    output_token_logprobs_val: list[float] | None = None
+    output_token_logprobs_idx: list[int] | None = None
+    input_top_logprobs_val: list[list[float] | None] | None = None
+    input_top_logprobs_idx: list[list[int] | None] | None = None
+    output_top_logprobs_val: list[list[float]] | None = None
+    output_top_logprobs_idx: list[list[int]] | None = None
+
+
 @dataclass
 class TokenIDOutput(BaseReq):
     """Carry one request's generated token and stopping state to the detokenizer."""
@@ -113,6 +133,18 @@ class TokenIDOutput(BaseReq):
     stop_buffer_length: int = 0
     skip_special_tokens: bool = False
     loop_steps: int | None = None  # core steps used to produce next_token
+    completion_tokens: int | None = None
+    finish_reason: dict[str, Any] | None = None
+
+
+@dataclass(kw_only=True)
+class TokenIDOutputWithDepth(TokenIDOutput):
+    decode_loop_steps: int | None = None
+
+
+@dataclass(kw_only=True)
+class ScoredTokenIDOutput(TokenIDOutputWithDepth):
+    logprobs: LogprobOutput
 
 
 @dataclass
@@ -133,6 +165,18 @@ class StrOutput(BaseReq):
     text: str | None = None
     error: str | None = None
     incremental_loop_steps: List[int] | None = None  # one count per emitted character
+    completion_tokens: int = 0
+    finish_reason: dict[str, Any] | None = None
+
+
+@dataclass(kw_only=True)
+class StrOutputWithDepth(StrOutput):
+    decode_token_loop_steps: tuple[int, int] | None = None
+
+
+@dataclass(kw_only=True)
+class ScoredStrOutput(StrOutputWithDepth):
+    logprobs: LogprobOutput
 
 
 @dataclass

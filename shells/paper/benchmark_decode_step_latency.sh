@@ -20,8 +20,7 @@ case "$MODEL" in
     huginn)
         MODEL_ID="$HUGINN_MODEL_ID"
         LOOP_STEPS="${LOOP_STEPS:-2 4 8 12 16}"
-        # Extend Huginn's RoPE table to the configured benchmark sequence limit.
-        MODEL_ARGS=(--json-model-override-args "{\"max_position_embeddings\":$MAX_MODEL_LEN}")
+        MODEL_ARGS=(--json-model-override-args "$HUGINN_MODEL_OVERRIDE_ARGS")
         ;;
     *) echo "Unknown MODEL '$MODEL' (expected: ouro, ouro26, huginn)." >&2; exit 1 ;;
 esac
@@ -50,7 +49,8 @@ for context_length in $CONTEXT_LENGTHS; do
             --dtype "$DTYPE" --attention-backend "$ATTENTION_BACKEND" \
             --page-size "$PAGE_SIZE" \
             --max-seq-len-override "$MAX_MODEL_LEN" \
-            --max-prefill-length "$MAX_PREFILL_LENGTH" \
+            --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
+            --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \
             "${KV_CACHE_ARGS[@]}" \
             --result-filename "$OUTPUT_PATH" \
             --profile-prefix "${OUTPUT_PATH%.jsonl}_steps${loop_steps}" \

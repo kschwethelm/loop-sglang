@@ -8,8 +8,8 @@
 set -euo pipefail
 
 # Override _common.sh defaults
-MIN_FREE_SLOTS_DELAY="${MIN_FREE_SLOTS_DELAY:-32}"
-WATERMARK="${WATERMARK:-0.1}"
+MIN_FREE_SLOTS_DELAY="${MIN_FREE_SLOTS_DELAY:-1}"
+WATERMARK="${WATERMARK:-0.2}"
 source "${REPO_ROOT:?Set REPO_ROOT to the repository root.}/shells/paper/_common.sh"
 
 MODEL_ID="$HUGINN_MODEL_ID"
@@ -19,8 +19,8 @@ NUM_FEWSHOT="${NUM_FEWSHOT:-8}"
 LOOP_STEPS="${LOOP_STEPS:-16}"
 OUTPUT_PATH="${OUTPUT_PATH:-outputs/ablations/accuracy/huginn}"
 
-FIXED_STEPS="${FIXED_STEPS-6 7 8 9 10 12 14 16 20 24 32}"
-THRESHOLDS="${THRESHOLDS-0.02 0.06 0.1 0.14 0.16 0.2 0.24 0.28 0.3 0.34}"
+FIXED_STEPS="${FIXED_STEPS-9 10 12 14 16 20 24 32}"
+THRESHOLDS="${THRESHOLDS-0.02 0.023 0.03 0.044 0.06 0.08 0.1 0.14 0.16 0.2}"
 # Every fixed depth runs under every layout.
 FIXED_LAYOUTS="${FIXED_LAYOUTS-depth_indexed shared}"
 # Every gated row runs under every layout.
@@ -59,19 +59,13 @@ run_eval() {
             model_args+=",disable_lookahead_exit=True"
         fi
         result_path+="_${timing}_threshold_${threshold}"
+        model_args+=",exit_depth_output=$result_path/depths.json"
     fi
-    local -a model_override_args=()
-    if [[ -n "${JSON_MODEL_OVERRIDE_ARGS:-}" ]]; then
-        local override_json
-        override_json="$(python3 -c 'import json, sys; print(json.dumps({"json_model_override_args": sys.argv[1]}))' "$JSON_MODEL_OVERRIDE_ARGS")"
-        model_override_args=(--model_args "$override_json")
-    fi
-
     mkdir -p -- "$result_path"
     echo "=== $MODEL_ID: $TASK, ${NUM_FEWSHOT}-shot, $scheduler, depth $steps, KV $policy${threshold:+, $timing, threshold $threshold} ==="
     uv run --frozen --extra eval --project "$REPO_ROOT" \
         python -u -m loopsgl.evaluation run --model loopsgl \
-        --model_args "$model_args" "${model_override_args[@]}" \
+        --model_args "$model_args" "json_model_override_args='$HUGINN_MODEL_OVERRIDE_ARGS'" \
         "${eval_args[@]}" --output_path "$result_path"
 }
 

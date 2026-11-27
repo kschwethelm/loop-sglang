@@ -14,7 +14,7 @@ from loopsgl.layers import (
     RMSNormFused,
     VocabParallelEmbedding,
 )
-from loopsgl.utils import init_logger, nvtx_annotate
+from loopsgl.utils import cached_load_hf_config, init_logger, nvtx_annotate
 
 from ..utils import GatedMLP, RopeAttn
 from .base import BaseLoopedForCausalLM, BaseLoopedModel
@@ -130,12 +130,47 @@ class HuginnModel(BaseLoopedModel):
         self._embed_scale = hf_config.init_values["embed_scale"]
         self._state_init_std = hf_config.init_values["std"]
         self._state_init = hf_config.state_init
+        self._checkpoint_path = hf_config.name_or_path
         if self._state_init != "zero" and self._state_init_std > 0:
             logger.warning_rank0(
                 "Huginn uses random loop-state initialization. "
                 "This makes the forward pass non-deterministic. "
-                "This affects prefix caching and retraction with recomputation."
+                "Prefix caching, chunked prefill, and retraction with recomputation can change outputs."
             )
+
+    def _removed_boundary_layer_prefixes(self, prefix: str) -> tuple[str, ...]:
+        if not self._checkpoint_path:
+            return ()
+        source = cached_load_hf_config(self._checkpoint_path)
+        if not isinstance(source, HuginnConfig) or source.num_core_layers != self.num_core_layers:
+            return ()
+
+        boundary_counts = (
+            ("prelude", self.num_prelude_layers, source.num_prelude_layers),
+            ("coda", self.num_coda_layers, source.num_coda_layers),
+        )
+        if any(not 0 <= retained <= total for _, retained, total in boundary_counts):
+            return ()
+        scope = f"{prefix}." if prefix else ""
+        return tuple(
+            f"{scope}{stage}.{index}."
+            for stage, retained, total in boundary_counts
+            for index in range(retained, total)
+        )
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        prefix: str = "",
+        _internal: bool = False,
+    ) -> None:
+        removed_layers = self._removed_boundary_layer_prefixes(prefix)
+        if removed_layers:
+            for key in tuple(state_dict):
+                if key.startswith(removed_layers):
+                    del state_dict[key]
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
 
     def cdb_state_spec(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
         """Describe shapes and dtypes of per-token states retained between CDB execution stages."""

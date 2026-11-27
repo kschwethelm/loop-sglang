@@ -23,6 +23,7 @@ from loopsgl.managers.io_struct import (
 from loopsgl.managers.scheduler import run_scheduler_process
 from loopsgl.managers.tokenizer_manager import TokenizerManager
 from loopsgl.server_args import ServerArgs
+from loopsgl.utils import set_ulimit
 
 
 class Engine:
@@ -53,6 +54,7 @@ class Engine:
             raise ValueError("Pass server_args or model options, not both.")
         if startup_timeout <= 0:
             raise ValueError("startup_timeout must be positive.")
+        set_ulimit()
         self.server_args = server_args
         self.loop = asyncio.new_event_loop()
         self.closed = False
@@ -166,10 +168,6 @@ class Engine:
     def num_retracted_reqs(self) -> int:
         return self._server_info["num_retracted_reqs"]
 
-    @property
-    def batch_size_metrics(self) -> dict[str, float]:
-        return self._server_info["batch_size_metrics"]
-
     def _run(self, coroutine: Any) -> Any:
         try:
             asyncio.get_running_loop()
@@ -206,6 +204,9 @@ class Engine:
         sampling_params: SamplingParams | dict | list[SamplingParams | dict] | None = None,
         *,
         input_ids: list[int] | list[list[int]] | None = None,
+        return_logprob: bool = False,
+        logprob_start_len: int = -1,
+        top_logprobs_num: int = 0,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         self.tokenizer_manager._raise_if_unavailable()
         if (prompt is None) == (input_ids is None):
@@ -229,12 +230,15 @@ class Engine:
                 normalized.append(value)
             else:
                 options = dict(value or {})
-                if "max_new_tokens" in options and "max_tokens" in options:
-                    raise ValueError("Specify only one of max_new_tokens and max_tokens.")
-                if "max_new_tokens" in options:
-                    options["max_tokens"] = options.pop("max_new_tokens")
                 normalized.append(SamplingParams(**options))
-        generator = self.tokenizer_manager.generate_request(prompts, normalized)
+
+        generator = self.tokenizer_manager.generate_request(
+            prompts,
+            normalized,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+        )
         outputs = await generator.__anext__()
         return outputs[0] if single else outputs
 
@@ -244,10 +248,22 @@ class Engine:
         sampling_params: SamplingParams | dict | list[SamplingParams | dict] | None = None,
         *,
         input_ids: list[int] | list[list[int]] | None = None,
+        return_logprob: bool = False,
+        logprob_start_len: int = -1,
+        top_logprobs_num: int = 0,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         self.reset_metrics()
         try:
-            return self._run(self.async_generate(prompt, sampling_params, input_ids=input_ids))
+            return self._run(
+                self.async_generate(
+                    prompt,
+                    sampling_params,
+                    input_ids=input_ids,
+                    return_logprob=return_logprob,
+                    logprob_start_len=logprob_start_len,
+                    top_logprobs_num=top_logprobs_num,
+                )
+            )
         finally:
             if self.tokenizer_manager.failure is None:
                 self.get_internal_state()

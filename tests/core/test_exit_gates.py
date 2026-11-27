@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 from loopsgl.core import LoopParams
+from loopsgl.kernel.exit_gates import ouro_exit_gate
 from loopsgl.layers import LinearReplicated
 from loopsgl.models.looped.base import BaseLoopedModel
 from loopsgl.models.looped.huginn import HuginnModel
@@ -60,10 +60,29 @@ def test_huginn_previous_state_and_threshold(dtype: torch.dtype) -> None:
     torch.testing.assert_close(current, current_before)
 
 
-@pytest.mark.skipif(
-    not os.environ.get("SLURM_JOB_ID") or not torch.cuda.is_available(),
-    reason="CUDA graph checks require CUDA in a SLURM allocation",
-)
+@pytest.mark.cuda
+@torch.inference_mode()
+def test_ouro_fused_gate_matches_fp32_reference() -> None:
+    """Mixed-depth gates preserve FP32 accumulation, subnormal hazards, and lookahead eligibility."""
+    logits = torch.tensor([-88, -20, -2, 0, 2, 20], device="cuda", dtype=torch.bfloat16)
+    previous = torch.tensor([0, 0.1998, 0.1, 0.1, 0.5, 1], device="cuda", dtype=torch.float32)
+    previous_before = previous.clone()
+    steps = torch.tensor([0, 0, 0, 0, 1, 2], device="cuda", dtype=torch.int32)
+    probability = torch.sigmoid(logits.float())
+    expected_state = previous + (1 - previous) * probability
+    assert expected_state[0].item() > 0
+
+    for lookahead in (False, True):
+        signal, state = ouro_exit_gate(
+            logits, previous, steps, threshold=0.2, min_loop_steps=2, lookahead=lookahead
+        )
+        expected_signal = (expected_state >= 0.2) & (steps + 1 + int(lookahead) >= 2)
+        torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+        torch.testing.assert_close(signal, expected_signal)
+        torch.testing.assert_close(previous, previous_before, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
 @pytest.mark.parametrize("model_type", [OuroModel, HuginnModel])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()

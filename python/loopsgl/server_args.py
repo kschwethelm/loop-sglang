@@ -266,14 +266,19 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
-        "--max-prefill-length",
-        "--max-extend-length",
+        "--max-prefill-tokens",
         type=int,
-        dest="max_extend_tokens",
-        default=ServerArgs.max_extend_tokens,
-        help="Chunk Prefill maximum chunk size in tokens.",
+        default=ServerArgs.max_prefill_tokens,
+        help="Stop admitting requests when a prefill batch reaches this token budget.",
     )
 
+    parser.add_argument(
+        "--chunked-prefill-size",
+        type=int,
+        default=ServerArgs.chunked_prefill_size,
+        help="Token budget for chunked prefill batches (default: 8192). "
+        "Use -1 to keep each prompt whole.",
+    )
     parser.add_argument(
         "--max-total-tokens",
         type=int,
@@ -304,6 +309,22 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> None:
         default="huggingface",
         choices=["huggingface", "modelscope"],
         help="The source to download model from. Either 'huggingface' or 'modelscope'.",
+    )
+
+    parser.add_argument(
+        "--cuda-event-timing",
+        dest="enable_cuda_event_timing",
+        action=argparse.BooleanOptionalAction,
+        default=ServerArgs.enable_cuda_event_timing,
+        help="Record compute-stream phase times with CUDA events.",
+    )
+
+    parser.add_argument(
+        "--decode-log-interval",
+        type=int,
+        default=ServerArgs.decode_log_interval,
+        help="The log reporting interval (in decode iterations) for decode batches. "
+        "CDB reports recurrent and coda batches at this interval independently.",
     )
 
     parser.add_argument(

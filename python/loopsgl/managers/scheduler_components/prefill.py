@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 from loopsgl.core import Req
 from loopsgl.managers.schedule_batch import ScheduleBatch
+from loopsgl.managers.scheduler_components.metrics_reporter import PrefillStats
 from loopsgl.utils import div_ceil, init_logger
 
 if TYPE_CHECKING:
@@ -20,12 +21,16 @@ logger = init_logger(__name__)
 @dataclass
 class PrefillAdder:
     token_budget: int
+    chunk_budget: int | None
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
     watermark: float
     has_running_reqs: bool
     reserve_decode: bool = False
+    admitted: int = 0
+    log_input_tokens: int = 0
+    log_hit_tokens: int = 0
 
     def _decode_headroom(self, req: Req) -> int:
         return (
@@ -44,6 +49,12 @@ class PrefillAdder:
         # TODO: consider host cache match case
         handle = self.cache_manager.match_req(req).cuda_handle
         cached_len = handle.cached_len
+        if (
+            self.chunk_budget is None
+            and self.admitted
+            and req.input_len - cached_len >= self.token_budget
+        ):
+            return None
         page_size = self.cache_manager.page_size
         needed_pages = div_ceil(req.input_len, page_size) - div_ceil(cached_len, page_size)
         watermark = self.watermark if self.has_running_reqs else 0.0
@@ -80,9 +91,13 @@ class PrefillAdder:
         cached_len: int,
     ) -> Req:
         remain_len = req.input_len - cached_len
-        chunk_size = min(self.token_budget, remain_len)
+        chunk_size = remain_len if self.chunk_budget is None else min(self.chunk_budget, remain_len)
+        self.admitted += 1
         is_chunked = chunk_size < remain_len
         self.token_budget -= chunk_size
+        if self.chunk_budget is not None:
+            self.chunk_budget -= chunk_size
+        self.log_input_tokens += chunk_size
         # Budget the full remaining prompt so later admissions cannot strand a chunked prefill.
         page_size = self.cache_manager.page_size
         self.reserved_size += (
@@ -103,10 +118,16 @@ class PrefillAdder:
         return req
 
     def try_add_one(self, req: Req) -> Req | None:
-        if self.token_budget <= 0:
+        if self.token_budget <= 0 or (self.chunk_budget is not None and self.chunk_budget <= 0):
             return None
 
         if req.kv.holds_kv:
+            if (
+                self.chunk_budget is None
+                and self.admitted
+                and req.input_len - req.kv.kv_committed_len >= self.token_budget
+            ):
+                return None
             assert req.kv.cache_handle is not None and req.kv.req_pool_idx is not None
             return self._add_one_req(
                 req=req,
@@ -117,6 +138,7 @@ class PrefillAdder:
 
         if resource := self._try_allocate_one(req):
             cache_handle, table_idx = resource
+            self.log_hit_tokens += cache_handle.cached_len
             return self._add_one_req(
                 req=req,
                 cache_handle=cache_handle,
@@ -135,10 +157,20 @@ class PrefillManager:
     min_free_slots_delay: int | None = None
     watermark: float = 0.0
     reserve_decode: bool = False
+    chunk_budget: int | None = None
     pending_list: List[Req] = field(default_factory=list)
 
     def add_one_req(self, req: TokenizedGenerateReqInput) -> None:
-        self.pending_list.append(Req(req.uid, req.input_ids, req.sampling_params))
+        self.pending_list.append(
+            Req(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                return_logprob=req.return_logprob,
+                logprob_start_len=req.logprob_start_len,
+                top_logprobs_num=req.top_logprobs_num,
+            )
+        )
 
     def add_retracted_req(self, req: Req) -> None:
         assert req.is_retracted and not req.kv.holds_kv
@@ -166,6 +198,7 @@ class PrefillManager:
 
         adder = PrefillAdder(
             token_budget=prefill_budget,
+            chunk_budget=self.chunk_budget,
             reserved_size=reserved_size,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
@@ -187,7 +220,16 @@ class PrefillManager:
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
-        return ScheduleBatch(reqs=reqs, phase="prefill")
+        return ScheduleBatch(
+            reqs=reqs,
+            phase="prefill",
+            prefill_stats=PrefillStats(
+                log_input_tokens=adder.log_input_tokens,
+                log_hit_tokens=adder.log_hit_tokens,
+                num_new_seqs=len(reqs),
+                num_running_reqs=len(self.decode_manager.running_reqs),
+            ),
+        )
 
     def abort_req(self, uid: int) -> Req | None:
         for i, req in enumerate(self.pending_list):

@@ -26,12 +26,19 @@ class GraphCaptureBuffer:
     logits: torch.Tensor
 
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+    def init(
+        cls,
+        bs: int,
+        vocab_size: int,
+        device: torch.device,
+        *,
+        logits_dtype: torch.dtype = torch.float32,
+    ) -> GraphCaptureBuffer:
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
-            logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
+            logits=torch.empty(bs, vocab_size, dtype=logits_dtype, device=device),
         )
 
     def set_batch(self, batch: ForwardBatch) -> None:

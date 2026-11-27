@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .cdb_model_runner import CDBModelRunner
 
 logger = init_logger(__name__)
-Phase = Literal["prelude", "core", "coda"]
+Phase = Literal["prelude", "core", "coda", "coda_prelude"]
 
 
 class CDBGraphRunner(GraphRunner):
@@ -32,7 +32,10 @@ class CDBGraphRunner(GraphRunner):
             logger.info_rank0("CDB CUDA graphs are disabled")
             return
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
+        self.buffer = GraphCaptureBuffer.init(
+            self.max_graph_bs, vocab_size, self.device, logits_dtype=self.model_runner.dtype
+        )
+        self.next_tokens = torch.empty(self.max_graph_bs, dtype=torch.int32, device=self.device)
         self.slots = self.model_runner.padding_state_slots[: self.max_graph_bs].clone()
         self.depths = torch.zeros(self.max_graph_bs, dtype=torch.int32, device=self.device)
         self.gates = (
@@ -59,8 +62,12 @@ class CDBGraphRunner(GraphRunner):
                 extend_lens_cpu=(1,) * size,
             )
             self.buffer.set_batch(batch)
-            for phase in ("prelude", "core", "coda"):
-                if self.model_runner.model.model.phase_uses_attention(phase):
+            phases: list[Phase] = ["prelude", "core", "coda"]
+            if self.model_runner.supports_fused_boundary():
+                phases.append("coda_prelude")
+            for phase in phases:
+                model_phase = "coda" if phase == "coda_prelude" else phase
+                if self.model_runner.model.model.phase_uses_attention(model_phase):
                     self.attn_backend.prepare_for_capture(batch)
                 graph = torch.cuda.CUDAGraph()
                 with get_global_ctx().forward_batch(batch):
@@ -73,10 +80,18 @@ class CDBGraphRunner(GraphRunner):
         logger.info_rank0(f"Captured CDB phase graphs for sizes: {self.graph_bs_list}")
 
     def _run_phase(self, phase: Phase, size: int) -> None:
-        output = self.model_runner._execute_phase(phase, self.slots[:size], self.depths[:size])
+        model_phase = "coda" if phase == "coda_prelude" else phase
+        output = self.model_runner._execute_phase(
+            model_phase, self.slots[:size], self.depths[:size]
+        )
         if phase == "core" and output is not None:
             assert self.gates is not None
             self.gates[:size].copy_(output)
+        elif phase == "coda_prelude":
+            assert output is not None
+            self.model_runner._write_greedy_prelude(
+                output, self.slots[:size], self.next_tokens[:size]
+            )
         elif phase == "coda":
             assert output is not None
             self.buffer.logits[:size].copy_(output)
@@ -96,22 +111,27 @@ class CDBGraphRunner(GraphRunner):
         # Recurrent core and coda consume persistent state instead of token IDs.
         if phase == "prelude":
             self.buffer.input_ids[:size].copy_(batch.input_ids)
-        uses_attention = self.model_runner.model.model.phase_uses_attention(phase)
+        model_phase = "coda" if phase == "coda_prelude" else phase
+        uses_attention = self.model_runner.model.model.phase_uses_attention(model_phase)
         if uses_attention:
             self.buffer.positions[:size].copy_(batch.positions)
             self.buffer.out_loc[:size].copy_(batch.out_loc)
         self.slots[: batch.size].copy_(slots)
-        self.depths[: batch.size].copy_(depths)
+        if phase == "core":
+            self.depths[: batch.size].copy_(depths)
         padding = size - batch.size
         if padding:
             self.slots[batch.size : size].copy_(self.model_runner.padding_state_slots[:padding])
-            self.depths[batch.size : size].zero_()
+            if phase == "core":
+                self.depths[batch.size : size].zero_()
         if uses_attention:
             self.attn_backend.prepare_for_replay(batch)
         batch.record_metadata_ready()
         self.graph_map[phase, size].replay()
         if phase == "core":
             return None if self.gates is None else self.gates[: batch.size]
+        if phase == "coda_prelude":
+            return self.next_tokens[: batch.size]
         if phase == "coda":
             return self.buffer.logits[: batch.size]
         return None

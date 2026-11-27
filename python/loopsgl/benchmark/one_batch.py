@@ -131,7 +131,8 @@ class TorchModelRunner:
             self.model_runner.page_table,
             disable_radix_cache=True,
         )
-        self.prefill_budget = config.max_extend_tokens
+        self.prefill_budget = config.max_prefill_tokens
+        self.prefill_chunk_budget = config.prefill_chunk_budget
         self.reqs: List[Req] = []
         self.start_event = torch.cuda.Event(enable_timing=True)
         self.end_event = torch.cuda.Event(enable_timing=True)
@@ -225,10 +226,11 @@ class TorchModelRunner:
         while pending:
             adder = PrefillAdder(
                 token_budget=self.prefill_budget,
+                chunk_budget=self.prefill_chunk_budget,
                 reserved_size=0,
                 cache_manager=self.cache_manager,
                 table_manager=self.table_manager,
-                watermark_size=0,
+                watermark=0.0,
                 has_running_reqs=self.table_manager.allocated_size > 0,
             )
             added: List[Req] = []
@@ -288,7 +290,9 @@ def prepare_synthetic_inputs_for_latency_test(
         Req(
             uid=index,
             origin_input_ids=torch.tensor(tokens, dtype=torch.int32),
-            sampling_params=SamplingParams(temperature=0, max_tokens=output_len, ignore_eos=True),
+            sampling_params=SamplingParams(
+                temperature=0, max_new_tokens=output_len, ignore_eos=True
+            ),
         )
         for index, tokens in enumerate(input_ids)
     ]
@@ -583,7 +587,8 @@ def latency_test(server_args: ServerArgs, bench_args: BenchArgs) -> List[dict[st
                         "page_size": server_args.page_size,
                         "num_pages": model_runner.model_runner.num_pages,
                         "max_seq_len": model_runner.model_runner.max_seq_len,
-                        "max_prefill_length": server_args.max_extend_tokens,
+                        "max_prefill_tokens": server_args.max_prefill_tokens,
+                        "chunked_prefill_size": server_args.chunked_prefill_size,
                         "cuda_graph_backend_prefill": server_args.cuda_graph_backend_prefill,
                         "cuda_graph_bs_prefill": model_runner.model_runner.prefill_graph_runner.buckets,
                         "loop_steps": getattr(
@@ -623,8 +628,8 @@ def cli_main() -> None:
         for value in getattr(args, name)
     ):
         parser.error("Batch sizes and input/output lengths must be positive.")
-    if args.max_extend_tokens <= 0:
-        parser.error("max-prefill-length must be positive.")
+    if args.max_prefill_tokens <= 0:
+        parser.error("max-prefill-tokens must be positive.")
     if args.log_decode_step < 0 or (
         args.profile_start_step is not None and args.profile_start_step < 0
     ):

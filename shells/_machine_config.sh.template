@@ -26,4 +26,4 @@ export SLURM_MAIL_USER="${SLURM_MAIL_USER-}"
 
 # _submit.sh validates and applies this full GPU UUID inside the allocated batch job.
 # Leave empty to use all GPUs allocated by SLURM
-export PIN_H100_UUID="${PIN_H100_UUID-}"
+export PIN_GPU_UUID="${PIN_GPU_UUID-}"

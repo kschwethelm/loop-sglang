@@ -18,19 +18,21 @@ MODEL="${MODEL:?set MODEL to ouro or huginn}"
 DATASET="${DATASET:?set DATASET to sharegpt, alpaca, or arxiv}"
 set_throughput_defaults
 
+MODEL_ARGS=()
 case "$MODEL" in
     ouro)
         MODEL_ID="$OURO_1_4B_MODEL_ID"
         LOOP_STEPS=4
         MIN_CODA_BATCH_SIZE=1
-        THRESHOLDS="${THRESHOLDS:-0.2 0.4 0.5 0.7 1.0}"
+        THRESHOLDS="${THRESHOLDS:-0.0001 0.06 0.2 0.4 1.0}"
         CONTROL=1.0
         ;;
     huginn)
         MODEL_ID="$HUGINN_MODEL_ID"
+        MODEL_ARGS=(--json-model-override-args "$HUGINN_MODEL_OVERRIDE_ARGS")
         LOOP_STEPS=16
         MIN_CODA_BATCH_SIZE=$((DECODE_WIDTH / 4 > 0 ? DECODE_WIDTH / 4 : 1))
-        THRESHOLDS="${THRESHOLDS:-0.28 0.16 0.1 0.0}"
+        THRESHOLDS="${THRESHOLDS:-0.14 0.06 0.03 0.0}"
         CONTROL=0.0
         ;;
     *) echo "unknown MODEL '$MODEL' (expected: ouro, huginn)" >&2; exit 1 ;;
@@ -68,9 +70,12 @@ for backend in $BACKENDS; do
         fi
         args+=(
             --model-path "$MODEL_ID"
+            "${MODEL_ARGS[@]}"
             --dataset-name custom --dataset-path "$WORKLOAD"
             --custom-input-format token-ids --no-shuffle
             --replay-exits
+            --cuda-event-timing
+            --cuda-graph-max-bs "$DECODE_WIDTH"
             --loop-steps "$LOOP_STEPS"
             --loop-cache-policy "$policy"
             --max-seq-len-override "$MAX_MODEL_LEN"
@@ -80,7 +85,8 @@ for backend in $BACKENDS; do
             --attention-backend "$ATTENTION_BACKEND"
             "${KV_CACHE_ARGS[@]}"
             --memory-ratio "$MEMORY_RATIO"
-            --max-prefill-length "$MAX_PREFILL_LENGTH"
+            --max-prefill-tokens "$MAX_PREFILL_TOKENS"
+            --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
             --page-size "$PAGE_SIZE"
             "${RADIX_CACHE_ARGS[@]}"
             --watermark "$WATERMARK"
@@ -89,7 +95,9 @@ for backend in $BACKENDS; do
             --result-filename "$OUTPUT_PATH"
         )
         [[ "$backend" == cdb-refill && -n "$MIN_CODA_BATCH_SIZE" ]] && args+=(--min-coda-batch-size "$MIN_CODA_BATCH_SIZE")
-        uv run --frozen --project "$REPO_ROOT" \
+        # Use a custom log directory for each experiment
+        log_experiment "$OUTPUT_PATH" "w${DECODE_WIDTH}_${backend}_q${threshold}" \
+            uv run --frozen --project "$REPO_ROOT" \
             python -u -m loopsgl.benchmark.offline_throughput "${args[@]}"
         echo ""
     done

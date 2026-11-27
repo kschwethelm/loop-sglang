@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from loopsgl.benchmark.perf import compare_memory_kernel_perf
 from loopsgl.kernel import store_cache
@@ -7,6 +8,7 @@ from loopsgl.utils import call_if_main
 
 
 @call_if_main(__name__)
+@pytest.mark.cuda
 def test_store_cache():
     HEAD_SIZE = 128
     NUM_TOKENS = 1048576  # 1M

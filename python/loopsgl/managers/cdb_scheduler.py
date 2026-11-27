@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, Literal, NamedTuple, NoReturn, Sequence
 
 import torch
@@ -45,7 +45,7 @@ class CDBDecodeToken:
     depth: int = 0
 
     def advance(self) -> CDBDecodeToken:
-        return replace(self, depth=self.depth + 1)
+        return CDBDecodeToken(self.req, self.req_pool_idx, self.position, self.depth + 1)
 
     @property
     def identity(self) -> tuple[Req, int, int]:
@@ -91,6 +91,12 @@ class CDBScheduler(BaseScheduler):
             self._warn_recompute()
         self.refill = config.cdb_config.refill
         self.disable_lookahead_exit = config.cdb_config.disable_lookahead_exit
+        if self.disable_lookahead_exit and getattr(config.hf_config, "exit_gate_type", None) in (
+            "lookahead",
+            "preloop",
+        ):
+            # These gates signal one step before the depth they select.
+            raise ValueError("The lookahead and preloop exit gates require lookahead exits.")
         self.min_coda_batch_size = (
             min(config.cdb_config.min_coda_batch_size, config.max_running_req)
             if self.refill
@@ -133,6 +139,8 @@ class CDBScheduler(BaseScheduler):
         _, batch, data = self._stage_cache
         if prepare_sampling:
             data = data._replace(sample_args=self.model_runner.sampler.prepare(batch))
+            if data.sample_args.needs_logprobs_or_trace:
+                data = self._prepare_logprobs(data)
         return data
 
     def _get_state_slots(self, data: ForwardInput) -> torch.Tensor:
@@ -149,12 +157,13 @@ class CDBScheduler(BaseScheduler):
             data.sample_args.temperatures,
             data.sample_args.top_k,
             data.sample_args.top_p,
+            data.sample_args.forced_token_ids,
         ):
             if tensor is not None:
                 tensor.record_stream(self.model_runner.stream)
-        return batch.req_pool_indices[: batch.size].to(torch.int64)
+        return batch.req_pool_indices[: batch.size]
 
-    def _prelude_successors(self, reqs: tuple[Req, ...]) -> None:
+    def _prelude_successors(self, reqs: tuple[Req, ...], *, precomputed: bool = False) -> None:
         # New tokens can follow a restore or a remapped prefix at the same position.
         self._stage_cache = None
         self.decode_manager.filter_reqs(reqs)
@@ -170,13 +179,23 @@ class CDBScheduler(BaseScheduler):
             for req in reqs
             if req.can_decode
         ]
-        if tokens:
+        if tokens and precomputed:
+            # Precomputed next-token state still requires KV allocation and admission checks.
+            self.cache_manager.allocate_paged(
+                [token.req for token in tokens],
+                num_running_reqs=self.table_manager.allocated_size,
+            )
+            self._enqueue_new(tokens)
+        elif tokens:
             data = self._stage_input(tokens)
             self.model_runner.stream.wait_stream(self.stream)
-            with profile_range("cdb.compute.prelude"), self.model_runner_stream_ctx:
+            with (
+                profile_range("cdb.compute.prelude"),
+                self.model_runner_stream_ctx,
+                self.cuda_event_timer.measure("prelude"),
+            ):
                 data.batch.input_ids = self.token_pool[data.input_tuple]
                 self.model_runner.forward_prelude(data.batch, self._get_state_slots(data))
-                self.batch_size_stats["prelude"].record(data.batch)
                 self.metadata_ready = data.batch.metadata_ready
             self._enqueue_new(tokens)
 
@@ -198,12 +217,13 @@ class CDBScheduler(BaseScheduler):
             if output is not None:
                 output.release()
             return
-        decisions = [False] * len(tokens)
         if output is not None:
             with profile_range("cdb.gate_wait"):
                 output.copy_done_event.synchronize()
-            decisions = [bool(value) for value in output.gates_cpu.tolist()]
+            decisions = output.gates_cpu.tolist()
             output.release()
+        else:
+            decisions = [False] * len(tokens)
         for index, token in enumerate(tokens):
             depths = token.req.sampling_params.replay_exit_depths
             if depths is not None:
@@ -232,11 +252,14 @@ class CDBScheduler(BaseScheduler):
         depths = make_device_tensor([token.depth for token in tokens], torch.int32, self.device)
         depths.record_stream(self.model_runner.stream)
         self.model_runner.stream.wait_stream(self.stream)
-        with profile_range("cdb.compute.core"), self.model_runner_stream_ctx:
+        with (
+            profile_range("cdb.compute.core"),
+            self.model_runner_stream_ctx,
+            self.cuda_event_timer.measure("recurrent"),
+        ):
             gates = self.model_runner.forward_recurrent(
                 data.batch, self._get_state_slots(data), depths
             )
-            self.batch_size_stats["recurrent"].record(data.batch)
             if self.model_runner.model.model.loop_params.exit_threshold is not None:
                 assert gates is not None
                 output = self.model_runner.stage_gate_readback(gates)
@@ -259,12 +282,19 @@ class CDBScheduler(BaseScheduler):
             self.pending_gate = current_gate
             self._consume_gate(previous)
         # Full depth is a hard cap independent of the asynchronously consumed exit signal.
-        completed = [token for token in self.core_ready_tokens if token.depth >= self.max_depth]
-        self.core_ready_tokens = [
-            token for token in self.core_ready_tokens if token.depth < self.max_depth
-        ]
-        self.coda_ready_tokens.extend(completed)
+        remaining: list[CDBDecodeToken] = []
+        for token in self.core_ready_tokens:
+            if token.depth >= self.max_depth:
+                self.coda_ready_tokens.append(token)
+            else:
+                remaining.append(token)
+        self.core_ready_tokens = remaining
         self.cohort_frozen = not self.refill
+        self.metrics_reporter.report_decode_stats(
+            data.batch.size,
+            can_run_cuda_graph=self.model_runner.graph_runner.can_use_cuda_graph(data.batch),
+            phase="recurrent",
+        )
 
     def _run_coda(self, tokens: Sequence[CDBDecodeToken]) -> None:
         if self.cache_manager.version_pool is not None:
@@ -274,21 +304,40 @@ class CDBScheduler(BaseScheduler):
                 [token.req for token in tokens], [token.depth for token in tokens]
             )
         data = self._stage_input(tokens, prepare_sampling=True)
-        for token in tokens:
-            self.coda_ready_tokens.remove(token)
+        if len(tokens) == len(self.coda_ready_tokens):
+            self.coda_ready_tokens.clear()
+        else:
+            selected = set(tokens)
+            self.coda_ready_tokens = [
+                token for token in self.coda_ready_tokens if token not in selected
+            ]
         self.model_runner.stream.wait_stream(self.stream)
-        with profile_range("cdb.compute.coda"), self.model_runner_stream_ctx:
-            gpu_tokens = self.model_runner.forward_coda(
-                data.batch, self._get_state_slots(data), data.sample_args
-            )
-            self.batch_size_stats["coda"].record(data.batch)
+        with (
+            profile_range("cdb.compute.coda"),
+            self.model_runner_stream_ctx,
+            self.cuda_event_timer.measure("coda"),
+        ):
+            scores = None
+            precomputed = self.model_runner.can_fuse_boundary(data.batch, data.sample_args)
+            if precomputed:
+                gpu_tokens = self.model_runner.forward_coda_prelude(
+                    data.batch, self._get_state_slots(data)
+                )
+            elif data.sample_args.needs_logprobs_or_trace:
+                gpu_tokens, scores = self.model_runner.forward_coda_with_logprobs(
+                    data.batch, self._get_state_slots(data), data.sample_args
+                )
+            else:
+                gpu_tokens = self.model_runner.forward_coda(
+                    data.batch, self._get_state_slots(data), data.sample_args
+                )
             self.metadata_ready = data.batch.metadata_ready
             for req in data.reqs:
                 req.complete_one(is_middle_chunk=False)
             self.token_pool[data.write_tuple] = gpu_tokens
-            output = self.model_runner.token_readback(gpu_tokens)
+            output = self.model_runner.token_readback(gpu_tokens, scores)
             self._record_row_write()
-        self._prelude_successors(data.reqs)
+        self._prelude_successors(data.reqs, precomputed=precomputed)
         self._queue_output(data, output, loop_steps=tuple(token.depth for token in tokens))
         self.recovery_deferred = False
         for req in self.deferred_recompute:
@@ -353,10 +402,8 @@ class CDBScheduler(BaseScheduler):
         batch = data.batch
         self._get_state_slots(data)
         batch.input_ids = self.token_pool[data.input_tuple]
-        output = self.model_runner.forward_prefill(batch, data.sample_args)
-        self.batch_size_stats["prefill"].record(
-            batch, padded_tokens=self.model_runner.prefill_graph_runner.bucket_for(batch)
-        )
+        with self.cuda_event_timer.measure("prefill"):
+            output = self.model_runner.forward_prefill(batch, data.sample_args)
         self.metadata_ready = batch.metadata_ready
         for req, middle in zip(data.reqs, data.is_middle_chunks):
             if req.is_retracted:
@@ -428,26 +475,32 @@ class CDBScheduler(BaseScheduler):
         if len(self.coda_ready_tokens) >= self.min_coda_batch_size:
             return CDBBatchPlan("coda", tokens=tuple(self.coda_ready_tokens))
         if not self.cohort_frozen and not self.draining_for_memory:
-            owned_prompt = any(req.kv.holds_kv for req in self.prefill_manager.pending_list)
-            if not self.recovery_deferred and not owned_prompt and self.retraction_manager.runnable:
+            if (
+                not self.recovery_deferred
+                and self.retraction_manager.runnable
+                and not any(req.kv.holds_kv for req in self.prefill_manager.pending_list)
+            ):
                 # Restore before fresh admission without draining other requests' token stages.
                 self.stream.wait_stream(self.model_runner.stream)
                 resumed = self.retraction_manager.resume_retracted_reqs()
                 if resumed:
                     self._prelude_successors(tuple(resumed))
-            reserved = (
-                self.cache_manager.new_pages_required(self.decode_manager.running_reqs)
-                * self.cache_manager.page_size
-                if self.retraction_mode != "none"
-                else 0
-            )
-            batch = self.prefill_manager.schedule_next_batch(
-                self.prefill_budget,
-                reserved_size=reserved,
-                allow_new_requests=not (self.retraction_manager.runnable or self.recovery_deferred),
-            )
-            if batch is not None:
-                return CDBBatchPlan("prefill", batch=batch)
+            if self.prefill_manager.runnable:
+                reserved = (
+                    self.cache_manager.new_pages_required(self.decode_manager.running_reqs)
+                    * self.cache_manager.page_size
+                    if self.retraction_mode != "none"
+                    else 0
+                )
+                batch = self.prefill_manager.schedule_next_batch(
+                    self.prefill_budget,
+                    reserved_size=reserved,
+                    allow_new_requests=not (
+                        self.retraction_manager.runnable or self.recovery_deferred
+                    ),
+                )
+                if batch is not None:
+                    return CDBBatchPlan("prefill", batch=batch)
         if self.core_ready_tokens:
             return CDBBatchPlan("core", tokens=tuple(self.core_ready_tokens))
         if self.coda_ready_tokens:

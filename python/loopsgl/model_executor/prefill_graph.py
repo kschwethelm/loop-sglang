@@ -30,6 +30,7 @@ from tqdm import tqdm
 
 from loopsgl.core import ForwardBatch, get_global_ctx
 from loopsgl.distributed import get_tp_info
+from loopsgl.layers.logits_processor import LogitsMetadata, LogitsProcessor, LogitsProcessorOutput
 from loopsgl.utils import init_logger
 from loopsgl.utils.breakable_graph import (
     BreakableCUDAGraph,
@@ -176,7 +177,8 @@ class PrefillGraphRunner:
         attn_backend: BaseAttnBackend,
         *,
         timing_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None,
-    ) -> torch.Tensor:
+        logits_metadata: LogitsMetadata | None = None,
+    ) -> torch.Tensor | LogitsProcessorOutput:
         bucket = self.bucket_for(batch)
         if bucket is None:
             raise ValueError("Prefill batch is not eligible for CUDA graph replay")
@@ -201,7 +203,12 @@ class PrefillGraphRunner:
                 timing_events[0].record(self.stream)
             self.graphs[bucket].replay()
             self.num_replays += 1
-            logits = self.model.lm_head.forward(self.output[:count])
+            if logits_metadata is not None:
+                logits = LogitsProcessor().forward(
+                    self.output[:count], self.model.lm_head, live_batch, logits_metadata
+                )
+            else:
+                logits = self.model.lm_head.forward(self.output[:count])
             if timing_events is not None:
                 timing_events[1].record(self.stream)
             return logits
