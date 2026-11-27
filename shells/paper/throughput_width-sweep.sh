@@ -9,6 +9,7 @@
 # Submit with:
 # - MODEL=ouro DATASET=sharegpt ./shells/_submit.sh shells/paper/throughput_width-sweep.sh
 # - MODEL=ouro DATASET=sharegpt CACHE_POLICY=last_exited ./shells/_submit.sh shells/paper/throughput_width-sweep.sh
+# - MODEL=ouro DATASET=sharegpt CACHE_POLICY=last_exited_copy BACKENDS=cdb-refill ./shells/_submit.sh shells/paper/throughput_width-sweep.sh
 
 set -euo pipefail
 source "${REPO_ROOT:?submit with ./shells/_submit.sh}/shells/paper/_common.sh"
@@ -71,6 +72,10 @@ for repeat in $(seq 0 $((REPEATS - 1))); do
             policy="$CACHE_POLICY"
             if [[ "$policy" == depth_indexed && "$backend" != cb ]]; then
                 echo "depth_indexed KV only supports CB; set BACKENDS=cb or select shared or last_exited." >&2
+                exit 1
+            fi
+            if [[ "$policy" == last_exited_copy && "$backend" == cb ]]; then
+                echo "last_exited_copy KV only supports CDB; set BACKENDS to CDB backends." >&2
                 exit 1
             fi
             args+=(

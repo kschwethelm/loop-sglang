@@ -2,11 +2,14 @@
 # Offline throughput with concurrency limited by fixed KV-cache memory budgets.
 # Compares full-depth CB with shared/depth-indexed KV and adaptive CDB-refill with shared/last-exited KV.
 # RUNS lists backend:policy pairs and defaults to all four configurations.
+# cdb-refill:last_exited_copy runs the copying last-exited cache, which keeps all depth slots
+# and uses the depth-indexed capacity of each budget.
 #
 # Submit with:
 # - MODEL=ouro DATASET=sharegpt ./shells/_submit.sh shells/paper/ablations/benchmark_memory.sh
 # - MODEL=ouro DATASET=arxiv ./shells/_submit.sh shells/paper/ablations/benchmark_memory.sh
 # - MODEL=ouro DATASET=sharegpt RUNS=cb:depth_indexed ./shells/_submit.sh shells/paper/ablations/benchmark_memory.sh
+# - MODEL=ouro DATASET=sharegpt RUNS=cdb-refill:last_exited_copy ./shells/_submit.sh shells/paper/ablations/benchmark_memory.sh
 
 set -euo pipefail
 WATERMARK="${WATERMARK:-0.3}"
@@ -36,9 +39,9 @@ REPEATS="${REPEATS:-1}"
 
 for run in $RUNS; do
     case "$run" in
-        cb:shared | cb:depth_indexed | cdb-refill:shared | cdb-refill:last_exited) ;;
+        cb:shared | cb:depth_indexed | cdb-refill:shared | cdb-refill:last_exited | cdb-refill:last_exited_copy) ;;
         *)
-            echo "unknown run '$run' (expected: cb:shared, cb:depth_indexed, cdb-refill:shared, cdb-refill:last_exited)" >&2
+            echo "unknown run '$run' (expected: cb:shared, cb:depth_indexed, cdb-refill:shared, cdb-refill:last_exited, cdb-refill:last_exited_copy)" >&2
             exit 1
             ;;
     esac
@@ -79,7 +82,7 @@ for repeat in $(seq 0 $((REPEATS - 1))); do
             result_path="${OUTPUT_PATH%.jsonl}_${budget}gib_repeat${repeat}.jsonl"
         fi
         echo "KV budget: $budget GiB"
-        echo "KV token capacities: shared=$shared_cache_tokens, depth_indexed=$depth_indexed_cache_tokens, last_exited=$last_exited_cache_tokens"
+        echo "KV token capacities: shared=$shared_cache_tokens, depth_indexed/last_exited_copy=$depth_indexed_cache_tokens, last_exited=$last_exited_cache_tokens"
         echo "Output: $result_path"
         echo ""
         for run in $RUNS; do
@@ -94,6 +97,7 @@ for repeat in $(seq 0 $((REPEATS - 1))); do
                 shared) cache_tokens="$shared_cache_tokens"; page_size=16 ;;
                 depth_indexed) cache_tokens="$depth_indexed_cache_tokens"; page_size=16 ;;
                 last_exited) cache_tokens="$last_exited_cache_tokens"; page_size=1 ;;
+                last_exited_copy) cache_tokens="$depth_indexed_cache_tokens"; page_size=16 ;;
             esac
             args+=(
                 --model-path "$MODEL_ID"

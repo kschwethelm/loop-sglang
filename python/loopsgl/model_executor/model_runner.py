@@ -36,9 +36,15 @@ class ModelRunner:
     """Execute model batches and own GPU resources for one tensor-parallel rank."""
 
     def __init__(self, config: EngineConfig) -> None:
-        if config.loop_cache_policy not in ("depth_indexed", "shared", "last_exited"):
+        if config.loop_cache_policy not in (
+            "depth_indexed",
+            "shared",
+            "last_exited",
+            "last_exited_copy",
+        ):
             raise ValueError(
-                "loop_cache_policy must be 'depth_indexed', 'shared', or 'last_exited'"
+                "loop_cache_policy must be 'depth_indexed', 'shared', 'last_exited', "
+                "or 'last_exited_copy'"
             )
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
@@ -92,6 +98,13 @@ class ModelRunner:
                 "core_end": self.model.model.num_prelude_layers + self.model.model.num_core_layers,
                 "loop_steps": self.model.model.loop_steps,
             }
+        if config.loop_cache_policy == "last_exited_copy":
+            model = self.model.model
+            if model.num_prelude_layers or model.num_coda_layers:
+                raise ValueError(
+                    "Copying last-exited KV requires a model without prelude or coda layers"
+                )
+            pool_kwargs = {"copy_depths": model.loop_steps}
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
             num_kv_layers=self.num_kv_layers,
@@ -217,6 +230,8 @@ class ModelRunner:
                 self.model.model.loop_steps,
                 cache_per_page // (2 * self.num_kv_layers),
             )
+        if config.loop_cache_policy == "last_exited_copy":
+            cache_per_page *= self.model.model.loop_steps
         if config.max_total_tokens is None:
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory

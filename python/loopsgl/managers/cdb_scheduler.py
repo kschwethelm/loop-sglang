@@ -337,6 +337,17 @@ class CDBScheduler(BaseScheduler):
             self.token_pool[data.write_tuple] = gpu_tokens
             output = self.model_runner.token_readback(gpu_tokens, scores)
             self._record_row_write()
+        if self.cache_manager.copy_pool is not None:
+            # The pre-coda event fences core writes while coda and prelude can overlap copies.
+            self.stream.wait_event(data.batch.metadata_ready)
+            self.cache_manager.copy_pool.copy_from_rows(
+                self.cache_manager.page_table,
+                [
+                    (token.req_pool_idx, token.position, token.depth)
+                    for token in tokens
+                    if token.depth < self.max_depth
+                ],
+            )
         self._prelude_successors(data.reqs, precomputed=precomputed)
         self._queue_output(data, output, loop_steps=tuple(token.depth for token in tokens))
         self.recovery_deferred = False

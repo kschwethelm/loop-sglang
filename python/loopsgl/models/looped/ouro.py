@@ -153,7 +153,10 @@ class OuroModel(BaseLoopedModel):
                 residual,
                 cache_layer_id=self.core_cache_layer_index(layer_id, loop_step),
                 core_metadata_depth=(
-                    loop_step if layer_id == 0 and self.loop_cache_policy == "last_exited" else None
+                    loop_step
+                    if layer_id == 0
+                    and self.loop_cache_policy in ("last_exited", "last_exited_copy")
+                    else None
                 ),
             )
         return self.norm.forward(x, residual)[0]

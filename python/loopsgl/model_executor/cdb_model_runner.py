@@ -59,7 +59,7 @@ class CDBModelRunner(ModelRunner):
     def _init_runtime_buffers(self, config: EngineConfig, free_memory: int) -> None:
         if not isinstance(self.model, BaseLoopedForCausalLM):
             raise ValueError("Continuous-depth batching requires a looped model")
-        if config.loop_cache_policy not in ("shared", "last_exited"):
+        if config.loop_cache_policy not in ("shared", "last_exited", "last_exited_copy"):
             raise ValueError(
                 "Continuous-depth batching requires shared or last-exited recurrent KV"
             )

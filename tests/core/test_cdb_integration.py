@@ -10,11 +10,14 @@ from typing import Any, Callable, Sequence
 import pytest
 import torch
 from loopsgl.core import Req, SamplingParams
+from loopsgl.kvcache.last_exited_copy import LastExitedCopyKVCache
 from loopsgl.managers.cdb_scheduler import CDBDecodeToken, CDBScheduler
 from loopsgl.managers.schedule_batch import ScheduleBatch
 
 
-def _run_worker(checkpoint: Path, mode: str, policy: str, tp_size: int) -> None:
+def _run_worker(
+    checkpoint: Path, mode: str, policy: str, tp_size: int, logits_path: Path | None = None
+) -> None:
     """Bound GPU and distributed execution in fresh subprocesses."""
     process = subprocess.Popen(
         [
@@ -24,6 +27,7 @@ def _run_worker(checkpoint: Path, mode: str, policy: str, tp_size: int) -> None:
             mode,
             policy,
             str(tp_size),
+            *([str(logits_path)] if logits_path is not None else []),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -44,13 +48,36 @@ def _run_worker(checkpoint: Path, mode: str, policy: str, tp_size: int) -> None:
 
 @pytest.mark.cuda
 @pytest.mark.parametrize(
-    ("model", "policy"), [("ouro", "shared"), ("ouro", "last_exited"), ("huginn", "shared")]
+    ("model", "policy"),
+    [
+        ("ouro", "shared"),
+        ("ouro", "last_exited"),
+        ("ouro", "last_exited_copy"),
+        ("huginn", "shared"),
+    ],
 )
 def test_cdb_numerical_correctness(
     model: str, policy: str, tiny_checkpoint: Callable[[str], Path]
 ) -> None:
     """Mixed-depth refill and padded graph replay preserve isolated eager logits and logical KV."""
     _run_worker(tiny_checkpoint(model), "numerical", policy, 1)
+
+
+@pytest.mark.cuda
+def test_last_exited_copy_matches_last_exited(
+    tiny_checkpoint: Callable[[str], Path], tmp_path: Path
+) -> None:
+    """Copied and aliased last-exited KV give the same logits for identical histories."""
+    checkpoint = tiny_checkpoint("ouro")
+    logits = {}
+    for policy in ("last_exited", "last_exited_copy"):
+        path = tmp_path / f"{policy}.pt"
+        _run_worker(checkpoint, "numerical", policy, 1, path)
+        logits[policy] = torch.load(path)
+    expected, actual = logits["last_exited"], logits["last_exited_copy"]
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        torch.testing.assert_close(actual[key], value, rtol=0.02, atol=0.002)
 
 
 @pytest.mark.cuda
@@ -82,7 +109,27 @@ class _ObservedScheduler(CDBScheduler):
             self.eos_during_drain += 1
         self.model_runner.stream.synchronize()
         indices = self.cache_manager.page_table[req.kv.req_pool_idx, : req.kv.kv_committed_len]
-        self.snapshots[req.uid] = self.model_runner.kv_cache.get_cpu_copy(indices)
+        kv_cache = self.model_runner.kv_cache
+        if isinstance(kv_cache, LastExitedCopyKVCache):
+            self.stream.synchronize()
+            snapshot = kv_cache.get_cpu_copy(
+                torch.cat(
+                    [
+                        indices.long() + depth * kv_cache.rows_per_depth
+                        for depth in range(kv_cache.loop_steps)
+                    ]
+                )
+            )
+            # Skipped depths of every exited token hold its last computed KV exactly.
+            depths = snapshot.unflatten(2, (kv_cache.loop_steps, len(indices)))
+            for owner, position, depth in self.exits:
+                if owner == req.uid and position < len(indices):
+                    final = depths[:, :, depth - 1, position].unsqueeze(2)
+                    skipped = depths[:, :, depth:, position]
+                    assert torch.equal(skipped, final.expand_as(skipped))
+            self.snapshots[req.uid] = snapshot
+        else:
+            self.snapshots[req.uid] = kv_cache.get_cpu_copy(indices)
         super()._free_req_resources(req)
 
 
@@ -104,7 +151,13 @@ def _assert_kv_close(actual: torch.Tensor, expected: torch.Tensor, token_count: 
 
 @torch.inference_mode()
 def _gpu_worker(
-    rank: int, checkpoint: str, mode: str, policy: str, tp_size: int, port: int
+    rank: int,
+    checkpoint: str,
+    mode: str,
+    policy: str,
+    tp_size: int,
+    port: int,
+    logits_path: str | None = None,
 ) -> None:
     """Run isolated references and production batched scheduling with controlled model histories."""
     from loopsgl.core import LoopParams
@@ -150,7 +203,7 @@ def _gpu_worker(
         use_pynccl=False,
         nccl_port=port,
         disable_radix_cache=True,
-        retraction_mode="offload",
+        retraction_mode="none" if policy == "last_exited_copy" else "offload",
     )
     scheduler = _ObservedScheduler(config)
     runner = scheduler.model_runner
@@ -260,6 +313,8 @@ def _gpu_worker(
                 reference_kv.update(snapshots)
                 reference_exits.extend(scheduler.exits)
             actual_logits, actual_kv = run([0, 1, 2], graphs=True)
+            if logits_path is not None and replay_exits:
+                torch.save(actual_logits, logits_path)
             assert actual_logits.keys() == reference_logits.keys()
             assert sorted(scheduler.exits) == sorted(reference_exits)
             # Batched graph replay and isolated eager execution round bf16 differently, and the
@@ -300,9 +355,9 @@ def _gpu_worker(
 if __name__ == "__main__":
     from loopsgl.utils import get_free_port
 
-    checkpoint, mode, policy, tp = sys.argv[1:]
+    checkpoint, mode, policy, tp, *logits_path = sys.argv[1:]
     size = int(tp)
-    arguments = (checkpoint, mode, policy, size, get_free_port())
+    arguments = (checkpoint, mode, policy, size, get_free_port(), *logits_path)
     if size == 1:
         _gpu_worker(0, *arguments)
     else:

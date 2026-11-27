@@ -9,6 +9,7 @@ from loopsgl.core import Req
 from loopsgl.kernel.batch import assign_req_to_token_pool_func
 from loopsgl.kvcache import BaseCacheHandle, BaseKVCachePool, MatchResult, create_prefix_cache
 from loopsgl.kvcache.last_exited import LastExitedKVCache
+from loopsgl.kvcache.last_exited_copy import LastExitedCopyKVCache
 from loopsgl.model_executor.sample import make_device_tensor
 from loopsgl.utils import div_ceil
 
@@ -35,6 +36,7 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.version_pool = kv_cache if isinstance(kv_cache, LastExitedKVCache) else None
+        self.copy_pool = kv_cache if isinstance(kv_cache, LastExitedCopyKVCache) else None
 
     def match_req(self, req: Req) -> MatchResult:
         input_len = req.input_len

@@ -87,14 +87,15 @@ def _add_cli_args(parser: argparse.ArgumentParser) -> None:
 
     parser.add_argument(
         "--loop-cache-policy",
-        choices=["depth_indexed", "shared", "last_exited"],
+        choices=["depth_indexed", "shared", "last_exited", "last_exited_copy"],
         default=ServerArgs.loop_cache_policy,
         help="KV cache policy for recurrent core layers of looped models. "
         "Defaults to depth_indexed for CB and last_exited for CDB. "
         "Prelude and coda layers keep one KV cache slot each. "
         "Depth-indexed gives each loop step its own KV cache slot (only for full-depth CB). "
         "Shared-cache gives each loop step only one KV cache slot that gets overwritten by each loop step (for CDB and CB). "
-        "Last-exited gives each loop step its own KV cache slot, skipped depths from early-exits free memory and later steps attend to the last exited loop cache (only for CDB).",
+        "Last-exited gives each loop step its own KV cache slot, skipped depths from early-exits free memory and later steps attend to the last exited loop cache (only for CDB). "
+        "Last-exited-copy keeps every depth slot and copies the last computed KV into skipped depths on exit, without freeing memory (only for CDB on models without prelude or coda layers).",
     )
 
     parser.add_argument(

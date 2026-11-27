@@ -55,10 +55,25 @@ class SchedulerConfig(EngineConfig):
             raise ValueError(
                 "Early exit requires scheduler='cdb'; use --scheduler cdb or omit --scheduler."
             )
-        if self.scheduler == "cdb" and self.loop_cache_policy not in {"shared", "last_exited"}:
-            raise ValueError("CDB requires loop_cache_policy='shared' or 'last_exited'.")
+        if self.scheduler == "cdb" and self.loop_cache_policy not in {
+            "shared",
+            "last_exited",
+            "last_exited_copy",
+        }:
+            raise ValueError(
+                "CDB requires loop_cache_policy='shared', 'last_exited', or 'last_exited_copy'."
+            )
         if self.loop_cache_policy == "last_exited" and self.page_size != 1:
             raise ValueError("Last-exited KV requires one-token pages.")
+        if self.loop_cache_policy == "last_exited_copy" and (
+            self.retraction_mode != "none"
+            or not self.disable_radix_cache
+            or self.attention_backend != "fa"
+        ):
+            raise ValueError(
+                "Copying last-exited KV requires the FA backend, retraction_mode='none', "
+                "and a disabled radix cache."
+            )
         if self.max_prefill_tokens < 1:
             raise ValueError("max_prefill_tokens must be positive.")
         if isinstance(self.chunked_prefill_size, bool) or not isinstance(

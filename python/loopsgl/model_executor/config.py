@@ -38,7 +38,9 @@ class EngineConfig:
     max_seq_len_override: int | None = None
     loop_params: LoopParams = field(default_factory=LoopParams)
     json_model_override_args: str = "{}"
-    loop_cache_policy: Literal["depth_indexed", "shared", "last_exited"] | None = None
+    loop_cache_policy: (
+        Literal["depth_indexed", "shared", "last_exited", "last_exited_copy"] | None
+    ) = None
     max_total_tokens: int | None = None
 
     def __post_init__(self) -> None:

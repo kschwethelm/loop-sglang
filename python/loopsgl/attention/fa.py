@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 
 from loopsgl.core import ForwardBatch, get_global_ctx
+from loopsgl.kvcache.last_exited_copy import LastExitedCopyKVCache
 from loopsgl.utils import init_logger, is_sm100_supported
 
 from .base import BaseAttnBackend, BaseAttnMetadata
@@ -71,6 +72,8 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
         out_loc, page_table = batch.out_loc, metadata.page_table
+        if isinstance(self.kvcache, LastExitedCopyKVCache):
+            out_loc, page_table = metadata.core_out_loc[0], metadata.core_page_table[0]
         if hasattr(self.kvcache, "slot_map"):
             core = self.core_start <= layer_id < self.core_end
             locations = metadata.core_out_loc if core else metadata.fixed_out_loc
@@ -96,6 +99,9 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
         assert metadata.core_page_table is not None and metadata.core_out_loc is not None
+        if isinstance(self.kvcache, LastExitedCopyKVCache):
+            self.kvcache.prepare_core_metadata(metadata, batch.out_loc, depths)
+            return
         prepare_last_exited_metadata(
             metadata.page_table,
             metadata.core_page_table,
@@ -108,6 +114,36 @@ class FlashAttentionBackend(BaseAttnBackend):
         )
 
     def _attach_kv_buffers(self, batch: ForwardBatch, *, capture: bool) -> None:
+        if isinstance(self.kvcache, LastExitedCopyKVCache):
+            metadata = batch.attn_metadata
+            table_name = f"core_{'capture' if capture else 'eager'}_table"
+            out_name = f"core_{'capture' if capture else 'eager'}_out"
+            if capture:
+                table, out = getattr(self, table_name), getattr(self, out_name)
+            else:
+                table = getattr(self, table_name)
+                out = getattr(self, out_name)
+                if table is None or any(
+                    a < b for a, b in zip(table.shape[1:], self.eager.page_table.shape)
+                ):
+                    table = torch.empty(
+                        (1, *self.eager.page_table.shape),
+                        dtype=torch.int32,
+                        device=self.kvcache.device,
+                    )
+                    setattr(self, table_name, table)
+                if out is None or out.shape[1] < batch.out_loc.numel():
+                    out = torch.empty(
+                        (1, 1 << (batch.out_loc.numel() - 1).bit_length()),
+                        dtype=torch.int32,
+                        device=self.kvcache.device,
+                    )
+                    setattr(self, out_name, out)
+            metadata.core_page_table = table[
+                :, : metadata.page_table.shape[0], : metadata.page_table.shape[1]
+            ]
+            metadata.core_out_loc = out[:, : batch.out_loc.numel()]
+            return
         if not hasattr(self.kvcache, "slot_map"):
             return
         metadata = batch.attn_metadata
@@ -181,6 +217,13 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
+        if isinstance(self.kvcache, LastExitedCopyKVCache):
+            self.core_capture_table = torch.zeros(
+                (1, *capture.page_table.shape), dtype=torch.int32, device=self.kvcache.device
+            )
+            self.core_capture_out = torch.zeros(
+                (1, max_bs), dtype=torch.int32, device=self.kvcache.device
+            )
         if hasattr(self.kvcache, "slot_map"):
             for kind, groups in (
                 ("core", self.kvcache.core_groups),

@@ -36,7 +36,9 @@ class BaseLoopedModel(ABC, BaseOP):
         self.num_prelude_layers = num_prelude_layers
         self.num_core_layers = num_core_layers
         self.num_coda_layers = num_coda_layers
-        self._loop_cache_policy: Literal["depth_indexed", "shared", "last_exited"] = "depth_indexed"
+        self._loop_cache_policy: Literal[
+            "depth_indexed", "shared", "last_exited", "last_exited_copy"
+        ] = "depth_indexed"
 
     @property
     def loop_steps(self) -> int:
@@ -44,11 +46,15 @@ class BaseLoopedModel(ABC, BaseOP):
         return self.loop_params.loop_steps
 
     @property
-    def loop_cache_policy(self) -> Literal["depth_indexed", "shared", "last_exited"]:
+    def loop_cache_policy(
+        self,
+    ) -> Literal["depth_indexed", "shared", "last_exited", "last_exited_copy"]:
         return self._loop_cache_policy
 
     @loop_cache_policy.setter
-    def loop_cache_policy(self, policy: Literal["depth_indexed", "shared", "last_exited"]) -> None:
+    def loop_cache_policy(
+        self, policy: Literal["depth_indexed", "shared", "last_exited", "last_exited_copy"]
+    ) -> None:
         if policy == "shared" and policy != self._loop_cache_policy and self.loop_steps > 1:
             tp_info = try_get_tp_info()
             if tp_info is None or tp_info.is_primary():

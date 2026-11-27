@@ -31,8 +31,8 @@ set_throughput_defaults() {
     local default_widths default_decode_width default_cache_tokens
     CACHE_POLICY="${CACHE_POLICY:-shared}"
     case "$CACHE_POLICY" in
-        shared | last_exited | depth_indexed) ;;
-        *) echo "unknown CACHE_POLICY '$CACHE_POLICY' (expected: shared, last_exited, depth_indexed)" >&2; return 1 ;;
+        shared | last_exited | last_exited_copy | depth_indexed) ;;
+        *) echo "unknown CACHE_POLICY '$CACHE_POLICY' (expected: shared, last_exited, last_exited_copy, depth_indexed)" >&2; return 1 ;;
     esac
     case "$DATASET" in
         sharegpt | alpaca)
@@ -46,9 +46,13 @@ set_throughput_defaults() {
         *) echo "unknown dataset '$DATASET' (expected: sharegpt, alpaca, arxiv)" >&2; return 1 ;;
     esac
     default_cache_tokens=327680
-    if [[ "$CACHE_POLICY" == last_exited ]]; then
+    if [[ "$CACHE_POLICY" == last_exited || "$CACHE_POLICY" == last_exited_copy ]]; then
         # Last-exited cache requires much more memory than shared KV, making some widths infeasible.
+        # The memory-saving variant needs one-token pages; the copying variant uses default pages.
         PAGE_SIZE=1
+        if [[ "$CACHE_POLICY" == last_exited_copy ]]; then
+            PAGE_SIZE=16
+        fi
         # Full-depth capacities sized to fit alongside model weights and runtime buffers.
         case "$MODEL" in
             ouro) default_cache_tokens=100000 ;;

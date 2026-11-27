@@ -27,7 +27,21 @@ def create_kvcache_pool(
     core_start: int | None = None,
     core_end: int | None = None,
     loop_steps: int | None = None,
+    copy_depths: int | None = None,
 ) -> BaseKVCachePool:
+    if copy_depths is not None:
+        from .last_exited_copy import LastExitedCopyKVCache
+
+        return LastExitedCopyKVCache(
+            loop_steps=copy_depths,
+            num_kv_heads=model_config.num_kv_heads,
+            num_pages=num_pages,
+            page_size=page_size,
+            num_layers=num_kv_layers,
+            head_dim=model_config.head_dim,
+            device=device,
+            dtype=dtype,
+        )
     if core_start is not None:
         from .last_exited import LastExitedKVCache
 
