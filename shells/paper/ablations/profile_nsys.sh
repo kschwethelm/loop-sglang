@@ -22,17 +22,19 @@ DATASET="${DATASET:-sharegpt}"
 WIDTHS="${WIDTHS:-64 512}" # Ablation width plus a near-uncapped wide regime
 set_throughput_defaults
 
+MODEL_ARGS=()
 case "$MODEL" in
     ouro)
         MODEL_ID="$OURO_1_4B_MODEL_ID"
         LOOP_STEPS=4
-        THRESHOLD="${THRESHOLD:-0.2}" # earliest threshold from exit sweep
+        THRESHOLD="${THRESHOLD:-0.0001}" # earliest threshold from exit sweep
         MIN_CODA_BATCHES="${MIN_CODA_BATCHES:-1}" # immediate coda (the default), as in the throughput sweeps
         ;;
     huginn)
         MODEL_ID="$HUGINN_MODEL_ID"
+        MODEL_ARGS=(--json-model-override-args "$HUGINN_MODEL_OVERRIDE_ARGS")
         LOOP_STEPS=16
-        THRESHOLD="${THRESHOLD:-0.28}" # earliest threshold from exit sweep
+        THRESHOLD="${THRESHOLD:-0.14}" # earliest threshold from exit sweep
         MIN_CODA_BATCHES="${MIN_CODA_BATCHES:-quarter}" # 'quarter' resolves against each maximum decode batch size
         ;;
     *) echo "unknown MODEL '$MODEL' (expected: ouro, huginn)" >&2; exit 1 ;;
@@ -42,10 +44,10 @@ WORKLOAD="$(replay_workload_for "$MODEL" "$DATASET" "$THRESHOLD")"
 
 BACKENDS="${BACKENDS:-cb cdb-norefill cdb-refill}"
 LIMIT="${LIMIT:-$(num_requests_for "$DATASET")}"
-MIN_FREE_SLOTS="${MIN_FREE_SLOTS:--}"
+MIN_FREE_SLOTS="${MIN_FREE_SLOTS:-${MIN_FREE_SLOTS_DELAY:-auto}}"
 export LOOPSGL_ENABLE_NVTX=1
 
-WORKLOAD_STEM="$(basename "${WORKLOAD%.jsonl}")"
+WORKLOAD_STEM="${MODEL}_${DATASET}"
 THRESH_TAG="q$(printf '%s' "$THRESHOLD" | tr '.' 'p')"
 POLICY_TAG="_kv${CACHE_POLICY}_pressure${RETRACTION_MODE}"
 
@@ -74,6 +76,9 @@ for width in $WIDTHS; do
                 min_coda=1
             fi
             for min_free in $MIN_FREE_SLOTS; do
+                if [[ "$min_free" == auto ]]; then
+                    min_free=$((width / 8 > 0 ? width / 8 : 1))
+                fi
                 run_tag="$backend"
                 [[ "$min_coda" != "-" ]] && run_tag="${backend}_k${min_coda}"
                 [[ "$min_free" != "-" ]] && run_tag="${run_tag}_s${min_free}"
@@ -103,6 +108,7 @@ for width in $WIDTHS; do
                 fi
                 args+=(
                     --model-path "$MODEL_ID"
+                    "${MODEL_ARGS[@]}"
                     --dataset-name custom --dataset-path "$WORKLOAD"
                     --custom-input-format token-ids --no-shuffle --replay-exits
                     --loop-steps "$LOOP_STEPS"
@@ -113,14 +119,13 @@ for width in $WIDTHS; do
                     --attention-backend "$ATTENTION_BACKEND"
                     "${KV_CACHE_ARGS[@]}"
                     --memory-ratio "$MEMORY_RATIO"
-                    --max-prefill-length "$MAX_PREFILL_LENGTH"
+                    --max-prefill-tokens "$MAX_PREFILL_TOKENS"
+                    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
                     --page-size "$PAGE_SIZE"
                     "${RADIX_CACHE_ARGS[@]}"
                     --watermark "$WATERMARK"
                     --retraction-mode "$RETRACTION_MODE"
                     --num-prompts "$limit"
-                    --cuda-graph-max-bs "$width"
-                    --cuda-graph-backend-prefill breakable
                     # Benchmark rows measured under profiling overhead are stored with
                     # their traces, outside the throughput sweep results.
                     --result-filename "$summary"

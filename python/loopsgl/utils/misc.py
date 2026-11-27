@@ -1,5 +1,21 @@
 from __future__ import annotations
 
+import resource
+
+from .logger import init_logger
+
+logger = init_logger(__name__)
+
+
+def set_ulimit(target_soft_limit: int = 65535) -> None:
+    """Raise the open-file soft limit to support concurrent serving connections."""
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit < target_soft_limit:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target_soft_limit, hard_limit))
+        except (OSError, ValueError) as error:
+            logger.warning(f"Failed to set RLIMIT_NOFILE: {error}")
+
 
 def call_if_main(name: str = "__main__", discard: bool | None = None):
     """Decorator to ensure a function will call when the script is run as main."""

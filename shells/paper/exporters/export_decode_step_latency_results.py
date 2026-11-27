@@ -3,7 +3,7 @@
 For each (context length, batch size), fit decode latency against loop depth to
 separate recurrent-step latency from the fixed prelude and coda overhead.
 Then fit recurrent-step latency against batch size at each context length.
-The second fit and figure fields follow the research repository's exporter.
+Use these fits to estimate the saturation batch size at each context length.
 Only batches with all requested regression depths contribute to the figure.
 Only GPU model medians are exported.
 These synchronized timings retain their measurement scope in export metadata.

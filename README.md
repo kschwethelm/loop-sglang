@@ -1,10 +1,11 @@
 # Loop-SGLang
 
 [![arXiv](https://img.shields.io/badge/arXiv-2608.09444-b31b1b.svg)](https://arxiv.org/abs/2608.09444)
+[![Project Page](https://img.shields.io/badge/Project-Page-blue.svg)](https://kschwethelm.github.io/continuous-depth-batching/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Loop-SGLang is a lightweight inference framwork for looped language models built on [Mini-SGLang](https://github.com/sgl-project/mini-sglang) and [SGLang](https://github.com/sgl-project/sglang).
-It includes serveral features missing in standard inference frameworks, like efficient per-token early-exits via [Continuous Depth Batching](https://arxiv.org/abs/2608.09444) and looped KV cache sharing policies.
+Loop-SGLang is a lightweight inference framework for looped language models built on [Mini-SGLang](https://github.com/sgl-project/mini-sglang) and [SGLang](https://github.com/sgl-project/sglang).
+It includes several features missing in standard inference frameworks, like efficient per-token early-exits via [Continuous Depth Batching](https://arxiv.org/abs/2608.09444) and looped KV cache sharing policies.
 
 ## Features for Looped Models
 
@@ -12,7 +13,7 @@ It includes serveral features missing in standard inference frameworks, like eff
 - **Supported looped models**: All four [Ouro](https://huggingface.co/collections/KristianS7/looped-lm-serving-inference) versions and [Huginn](https://huggingface.co/KristianS7/huginn-0125).
   Use our model forks for compatibility with Loop-SGLang: [forks on HF](https://huggingface.co/collections/KristianS7/looped-lm-serving-inference).
 - **Looped KV caches**: Depth-indexed, last-exited, and fully shared looped KV policies.
-- **Downstream task evaluation**: Clean [lm-eval](https://github.com/eleutherai/lm-evaluation-harness) integration (`loopsgl.evaluation`).
+- **Downstream task evaluation**: [lm-eval](https://github.com/eleutherai/lm-evaluation-harness) integration, including continuation likelihood with forced decoding needed for evaluating early exits and shared KV caches.
 - **Runtime benchmarking**:  via `loopsgl.benchmark`.
 - **CDB paper reproduction**: Scripts in `shells` folder reproduce the results of [Continuous Depth Batching paper](https://arxiv.org/abs/2608.09444).
 
@@ -147,19 +148,32 @@ loopsgl serve --model "KristianS7/Ouro-1.4B-Thinking" --exit-threshold 0.2 --she
 
 ![shell-example](assets/shell.png)
 
-You can also use `/reset` to clear the chat history.
+Use `/clear` to clear the chat history.
 Reasoning traces are displayed in italic text and loop steps are colored.
 Use `/colors` to toggle shell styling.
 
 ### 5. Accuracy Evaluation
 
-Install the optional `eval` dependencies and run generation tasks such as GSM8K through the offline engine.
-Log-likelihood and perplexity evaluation are not yet supported.
+Install the optional `eval` dependencies to run generation and continuation likelihood benchmarks.
+For example, run GSM8K generation on Ouro with early exits:
 
 ```bash
 uv run --extra eval python -m loopsgl.evaluation run --model loopsgl \
-    --model_args pretrained=KristianS7/Ouro-1.4B,loop_cache_policy=depth_indexed,max_gen_toks=256 \
+    --model_args pretrained=KristianS7/Ouro-1.4B,loop_cache_policy=last_exited,exit_threshold=0.2,max_gen_toks=256 \
     --tasks gsm8k_cot --num_fewshot 3 --batch_size auto
+```
+
+Likelihood scoring uses prefill for non-looped models and full-depth CB with depth-indexed KV.
+Early exits and shared KV require forced decoding as otherwise the tokens attend to the wrong KV states.
+The model decodes the continuation token by token using KV cache, as in normal generation, but receives the continuation token as the next input instead of its own prediction.
+We collect the log probabilities of the continuation tokens.
+Set `score_first_token_in_decode=True` to score the first continuation token through decode as well.
+For example, run HellaSwag with early exits:
+
+```bash
+uv run --extra eval python -m loopsgl.evaluation run --model loopsgl \
+    --model_args pretrained=KristianS7/Ouro-1.4B,loop_cache_policy=last_exited,exit_threshold=0.2,score_first_token_in_decode=True \
+    --tasks hellaswag --num_fewshot 10 --batch_size auto
 ```
 
 ## 📚 Learn More

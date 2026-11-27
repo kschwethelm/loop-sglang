@@ -4,11 +4,27 @@ from pathlib import Path
 from typing import Callable
 
 import pytest
+import torch
 from loopsgl.models.looped.config import HuginnConfig, OuroConfig
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Skip tests marked ``cuda`` when fewer CUDA devices are visible than they need.
+
+    Select CPU-only tests with ``-m "not cuda"`` and GPU tests with ``-m cuda``.
+    """
+    available = torch.cuda.device_count()
+    for item in items:
+        # A parametrized case can add cuda(devices=N) on top of the test's plain cuda marker.
+        needed = max(
+            (marker.kwargs.get("devices", 1) for marker in item.iter_markers("cuda")), default=0
+        )
+        if available < needed:
+            item.add_marker(pytest.mark.skip(reason=f"Requires {needed} CUDA device(s)"))
 
 
 @pytest.fixture

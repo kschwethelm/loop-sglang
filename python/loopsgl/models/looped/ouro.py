@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Dict, Literal, Tuple
 
 import torch
+from loopsgl.kernel.exit_gates import ouro_exit_gate
 from loopsgl.layers import (
     BaseOP,
     LinearReplicated,
@@ -54,6 +55,8 @@ class OuroDecoderLayer(BaseOP):
 
 
 class OuroModel(BaseLoopedModel):
+    prelude_is_stateless = True
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(
             loop_steps=config.loop_steps,
@@ -63,13 +66,18 @@ class OuroModel(BaseLoopedModel):
         threshold = self.loop_params.exit_threshold
         if threshold is not None and not 0 < threshold <= 1:
             raise ValueError("Ouro exit_threshold must be in (0, 1]")
-        self.min_loop_steps = getattr(config.hf_config, "min_loop_steps", 1)
+        self._exit_gate_type = getattr(config.hf_config, "exit_gate_type", "early_exit")
+        if self._exit_gate_type not in ("early_exit", "lookahead", "preloop"):
+            raise ValueError("Ouro exit_gate_type must be 'early_exit', 'lookahead', or 'preloop'")
+        preloop = self._exit_gate_type == "preloop"
+        minimum = 2 if preloop else 1
+        self.min_loop_steps = getattr(config.hf_config, "min_loop_steps", minimum)
         if (
             isinstance(self.min_loop_steps, bool)
             or not isinstance(self.min_loop_steps, int)
-            or not 1 <= self.min_loop_steps <= self.loop_steps
+            or not minimum <= self.min_loop_steps <= self.loop_steps
         ):
-            raise ValueError("Ouro min_loop_steps must be an integer in [1, loop_steps]")
+            raise ValueError(f"Ouro min_loop_steps must be an integer in [{minimum}, loop_steps]")
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -82,9 +90,16 @@ class OuroModel(BaseLoopedModel):
             eps=config.rms_norm_eps,
         )
         self.early_exit_gate = LinearReplicated(config.hidden_size, 1, has_bias=True)
-        self._exit_gate_type = getattr(config.hf_config, "exit_gate_type", "early_exit")
-        if self._exit_gate_type not in ("early_exit", "lookahead"):
-            raise ValueError("Ouro exit_gate_type must be 'early_exit' or 'lookahead'")
+        if preloop:
+            assert config.hf_config is not None
+            preloop_gate_width = config.hf_config.total_ut_steps
+            if self.loop_steps > preloop_gate_width:
+                raise ValueError(
+                    f"Ouro preloop supports at most {preloop_gate_width} recurrent steps"
+                )
+            self.preloop_exit_gate = LinearReplicated(
+                config.hidden_size, preloop_gate_width, has_bias=True
+            )
 
     def load_state_dict(
         self,
@@ -93,15 +108,18 @@ class OuroModel(BaseLoopedModel):
         prefix: str = "",
         _internal: bool = False,
     ) -> None:
-        """Load all model weights after mapping the selected gate weights to 'early_exit_gate' keys."""
+        """Load the selected gate alongside the model weights."""
         early_prefix = f"{prefix}.early_exit_gate" if prefix else "early_exit_gate"
         lookahead_prefix = f"{prefix}.lookahead_exit_gate" if prefix else "lookahead_exit_gate"
+        preloop_prefix = f"{prefix}.preloop_exit_gate" if prefix else "preloop_exit_gate"
         for parameter in ("weight", "bias"):
             lookahead_key = f"{lookahead_prefix}.{parameter}"
             if self._exit_gate_type == "lookahead":
                 state_dict[f"{early_prefix}.{parameter}"] = state_dict.pop(lookahead_key)
             else:
                 state_dict.pop(lookahead_key, None)
+            if self._exit_gate_type != "preloop":
+                state_dict.pop(f"{preloop_prefix}.{parameter}", None)
         super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
 
     def cdb_state_spec(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
@@ -112,6 +130,11 @@ class OuroModel(BaseLoopedModel):
 
     def phase_uses_attention(self, phase: Literal["prelude", "core", "coda"]) -> bool:
         return phase == "core"
+
+    def get_fused_prelude_embedding(self) -> torch.Tensor | None:
+        if self._exit_gate_type == "preloop":
+            return None
+        return self.embed_tokens.weight if self.embed_tokens.tp_size == 1 else None
 
     def forward_prelude(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self.embed_tokens.forward(input_ids), None
@@ -136,7 +159,14 @@ class OuroModel(BaseLoopedModel):
         return self.norm.forward(x, residual)[0]
 
     def init_exit_state(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Start each token's cumulative exit probability at zero in FP32."""
+        """Initialize the exit depth or cumulative probability for each token."""
+        if self._exit_gate_type == "preloop":
+            threshold = self.loop_params.exit_threshold
+            assert threshold is not None
+            logits = self.preloop_exit_gate.forward(hidden_states).float()
+            cdf = logits.softmax(dim=-1).cumsum(dim=-1)
+            depths = (cdf < threshold).sum(dim=-1) + 1
+            return depths.clamp(self.min_loop_steps, self.loop_steps).float()
         return torch.zeros(hidden_states.shape[0], dtype=torch.float32, device=hidden_states.device)
 
     def exit_signal(
@@ -145,8 +175,21 @@ class OuroModel(BaseLoopedModel):
         exit_state: torch.Tensor,
         loop_step: int | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Accumulate exit probability and threshold it to request an exit."""
+        """Signal exit at the selected depth or cumulative probability threshold."""
+        if self._exit_gate_type == "preloop":
+            # CDB consumes the signal one step later in its default mode.
+            return loop_step + 2 >= exit_state, exit_state
         logits = self.early_exit_gate.forward(hidden_states).squeeze(-1)
+        if logits.is_cuda:
+            # use efficient kernel if not on CPU
+            return ouro_exit_gate(
+                logits,
+                exit_state,
+                loop_step,
+                threshold=self.loop_params.exit_threshold,
+                min_loop_steps=self.min_loop_steps,
+                lookahead=self._exit_gate_type == "lookahead",
+            )
         next_exit_state = cumulative_exit_probability(logits, exit_state)
         exit_depth = loop_step + 1 + (self._exit_gate_type == "lookahead")
         signal = (next_exit_state >= self.loop_params.exit_threshold) & (

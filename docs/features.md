@@ -11,7 +11,7 @@ For detailed command-line arguments and configuration options, run `loopsgl serv
 For demonstration and testing purposes, an interactive shell mode is available.
 In this mode, users can input prompts directly, and the LLM will generate responses in real-time.
 The shell automatically caches chat history to maintain context.
-To clear the conversation history and start a new session, use the `/reset` command.
+To clear the conversation history and start a new session, use the `/clear` command.
 
 Example:
 
@@ -39,9 +39,11 @@ And the following standard model architectures:
 ## Chunked Prefill
 
 Chunked Prefill, a technique introduced by [Sarathi-Serve](https://arxiv.org/abs/2403.02310), is enabled by default.
-This feature splits long prompts into smaller chunks during the prefill phase, significantly reducing peak memory usage and preventing Out-Of-Memory (OOM) errors in long-context serving.
-The chunk size can be configured using `--max-prefill-length n`.
-Note that setting `n` to a very small value (e.g., 128) is not recommended as it may significantly degrade performance.
+This feature splits long prompts into smaller chunks during the prefill phase, reducing peak memory usage and helping avoid Out-Of-Memory (OOM) errors in long-context serving.
+Note: Each chunk uses the KV cache computed from preceding chunks, so chunking can affect outputs depending on the KV cache policy.
+For example, shared KV in looped models changes what each chunk attends to compared with a full prefill.
+--chunked-prefill-size n configures the chunk budget shared across all prompts in a prefill batch (-1 disables chunking).
+--max-prefill-tokens n is a separate admission budget that stops adding prompts once it is reached or exceeded.
 
 ## Page Size
 

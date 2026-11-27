@@ -60,13 +60,15 @@ def _cpu_scheduler(config: ServerArgs, ack_queue: mp.Queue, *, silent_output: bo
                     token = int(request.input_ids[0])
                     if token == 63:
                         raise RuntimeError("Injected scheduler failure: " + "x" * 100_000)
-                    if request.sampling_params.max_tokens == 100:
+                    if request.sampling_params.max_new_tokens == 100:
                         pending_uids.add(request.uid)
                         continue
-                    for index in range(request.sampling_params.max_tokens):
+                    for index in range(request.sampling_params.max_new_tokens):
                         tokens.put(
                             TokenIDOutput(
-                                request.uid, token, index + 1 == request.sampling_params.max_tokens
+                                request.uid,
+                                token,
+                                index + 1 == request.sampling_params.max_new_tokens,
                             )
                         )
 
@@ -103,7 +105,7 @@ def test_runtime_lifecycle(
             {"top_p": 1.5},
             {"top_k": 0},
             {"top_k": True},
-            {"max_tokens": 1.5},
+            {"max_new_tokens": 1.5},
         ):
             with pytest.raises(ValueError):
                 await engine.async_generate(input_ids=[8], sampling_params=invalid)
@@ -144,7 +146,10 @@ def test_runtime_lifecycle(
         uid = engine.tokenizer_manager.new_request()
         await engine.tokenizer_manager.send_request(
             GenerateReqInput(
-                uid=uid, text=None, input_ids=[11], sampling_params=SamplingParams(max_tokens=100)
+                uid=uid,
+                text=None,
+                input_ids=[11],
+                sampling_params=SamplingParams(max_new_tokens=100),
             )
         )
         response = engine.tokenizer_manager._wait_one_response(

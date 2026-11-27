@@ -18,6 +18,9 @@ logger = init_logger(__name__)
 
 
 class BaseLoopedModel(ABC, BaseOP):
+    # Stateless preludes are deterministic and row-local, with no persistent request-state access.
+    prelude_is_stateless: bool = False
+
     def __init__(
         self,
         *,
@@ -100,6 +103,16 @@ class BaseLoopedModel(ABC, BaseOP):
         Fully looped models can override this to return True only for the core.
         """
         return True
+
+    def get_fused_prelude_embedding(self) -> torch.Tensor | None:
+        """Return the embedding table if it can directly initialize the next token.
+
+        The prelude must be an embedding lookup with no injection state.
+        The lookup must not require communication.
+        Exit initialization must return one FP32 zero per token.
+        Return None otherwise.
+        """
+        return None
 
     @abstractmethod
     def forward_prelude(

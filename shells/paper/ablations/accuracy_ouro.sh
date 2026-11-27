@@ -8,8 +8,8 @@
 set -euo pipefail
 
 # Override _common.sh defaults
-MIN_FREE_SLOTS_DELAY="${MIN_FREE_SLOTS_DELAY:-32}"
-WATERMARK="${WATERMARK:-0.1}"
+MIN_FREE_SLOTS_DELAY="${MIN_FREE_SLOTS_DELAY:-1}"
+WATERMARK="${WATERMARK:-0.2}"
 source "${REPO_ROOT:?Set REPO_ROOT to the repository root.}/shells/paper/_common.sh"
 
 MODEL_ID="$OURO_1_4B_MODEL_ID"
@@ -20,7 +20,7 @@ MIN_LOOP_STEPS="${MIN_LOOP_STEPS:-2}"
 OUTPUT_PATH="${OUTPUT_PATH:-outputs/ablations/accuracy/ouro}"
 
 FIXED_STEPS="${FIXED_STEPS-1 2 3 4}"
-THRESHOLDS="${THRESHOLDS-0.01 0.1 0.2 0.25 0.3 0.4 0.5 0.7 0.9 1.0}"
+THRESHOLDS="${THRESHOLDS-0.0001 0.06 0.1 0.2 0.3 0.4 0.45 0.5 0.7 1.0}"
 # Every fixed depth runs under every layout.
 FIXED_LAYOUTS="${FIXED_LAYOUTS-depth_indexed shared}"
 # Test multiple exit gate policies.
@@ -39,14 +39,15 @@ if [[ -n "$LIMIT" ]]; then
 fi
 for gate in $GATES; do
     case "$gate" in
-        early_exit_immediate | lookahead) ;;
-        *) echo "unknown gate '$gate' (expected: early_exit_immediate, lookahead)" >&2; exit 1 ;;
+        early_exit_immediate | early_exit_delayed | lookahead | preloop) ;;
+        *) echo "unknown gate '$gate' (expected: early_exit_immediate, early_exit_delayed, lookahead, preloop)" >&2; exit 1 ;;
     esac
 done
 
 run_eval() {
     local scheduler="$1" policy="$2" steps="$3" gate="${4:-}" threshold="${5:-}"
     local page_size="$PAGE_SIZE" model_args result_path gate_type override_json
+    local min_loop_steps="$MIN_LOOP_STEPS"
     if [[ "$policy" == last_exited ]]; then
         page_size=1
     fi
@@ -63,14 +64,17 @@ run_eval() {
             early_exit_immediate)
                 model_args+=",disable_lookahead_exit=True"
                 ;;
+            early_exit_delayed) min_loop_steps=1 ;; # The original gate's minimum applies before the lookahead step
             lookahead) gate_type=lookahead ;;
+            preloop) gate_type=preloop ;;
         esac
         result_path+="_${gate}_threshold_${threshold}"
+        model_args+=",exit_depth_output=$result_path/depths.json"
     fi
     local -a model_override_args=()
     if [[ "$scheduler" == cdb ]]; then
-        override_json="$(python3 -c 'import json, sys; print(json.dumps({"json_model_override_args": json.dumps({"exit_gate_type": sys.argv[1], "min_loop_steps": int(sys.argv[2])})}))' "$gate_type" "$MIN_LOOP_STEPS")"
-        model_override_args=(--model_args "$override_json")
+        override_json="{\"exit_gate_type\":\"$gate_type\",\"min_loop_steps\":$min_loop_steps}"
+        model_override_args=("json_model_override_args='$override_json'")
     fi
 
     mkdir -p -- "$result_path"

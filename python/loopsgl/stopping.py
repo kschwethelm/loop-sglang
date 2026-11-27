@@ -38,6 +38,7 @@ class StopChecker:
             set(tokenizer.all_special_ids) if self.skip_special_tokens else set()
         )
         self.output_ids: List[int] = []
+        self.matched_stop: str | None = None
         self.buffer_length = max((len(stop) - 1 for stop in self.stop_strs), default=0)
         # A Unicode character can span four byte tokens, and generation may tokenize a
         # stop differently from encode(stop).
@@ -70,5 +71,6 @@ class StopChecker:
         for stop in self.stop_strs:
             start = text.find(stop)
             if start != -1:
+                self.matched_stop = stop
                 return text[: start + len(stop) if self.no_stop_trim else start]
         return None

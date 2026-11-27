@@ -8,8 +8,12 @@ from loopsgl.managers.io_struct import (
     BaseReq,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ScoredStrOutput,
+    ScoredTokenIDOutput,
     StrOutput,
+    StrOutputWithDepth,
     TokenIDOutput,
+    TokenIDOutputWithDepth,
 )
 from loopsgl.utils import (
     ZmqPullQueue,
@@ -77,6 +81,7 @@ class DecodeStatus:
     loop_step_text: str = ""
     loop_steps: List[int] | None = None
     pending_loop_steps: int = 0
+    completion_tokens: int = 0
 
     def update_loop_steps(self, text: str, current_loop_steps: int | None = None) -> None:
         """Retain character attribution across buffered decoding and final text cleanup."""
@@ -146,6 +151,10 @@ class DetokenizerManager:
                     sent_offset=0,
                 )
             s = self.decode_map[msg.uid]
+            if msg.completion_tokens is not None:
+                if msg.completion_tokens < s.completion_tokens:
+                    raise ValueError("Generated-token counts must be nondecreasing.")
+                s.completion_tokens = msg.completion_tokens
             if not msg.skip_token:
                 s.decoded_ids.append(msg.next_token)
                 if msg.loop_steps is not None:
@@ -218,8 +227,23 @@ class DetokenizerManager:
                     token_ids=list(s.decoded_ids) if msg.finished else None,
                     text=output_str if msg.finished else None,
                     incremental_loop_steps=incremental_loop_steps,
+                    completion_tokens=s.completion_tokens,
+                    finish_reason=msg.finish_reason,
                 )
             )
+            if isinstance(msg, TokenIDOutputWithDepth):
+                depth = msg.decode_loop_steps
+                token_depth = (msg.next_token, depth) if depth is not None else None
+                if isinstance(msg, ScoredTokenIDOutput):
+                    replies[-1] = ScoredStrOutput(
+                        **vars(replies[-1]),
+                        logprobs=msg.logprobs,
+                        decode_token_loop_steps=token_depth,
+                    )
+                else:
+                    replies[-1] = StrOutputWithDepth(
+                        **vars(replies[-1]), decode_token_loop_steps=token_depth
+                    )
             if msg.finished:
                 del self.decode_map[msg.uid]
 

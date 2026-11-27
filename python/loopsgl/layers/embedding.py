@@ -95,6 +95,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[indices].contiguous()
             del indices
 
+        return self.project(x)
+
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """Project already selected rows through the shared vocabulary head."""
         module = self.tied_embedding or self
         logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:
@@ -102,7 +106,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)

@@ -17,13 +17,18 @@ import dataclasses
 import json
 import logging
 import random
+import sys
 import time
 from typing import TYPE_CHECKING, Any, Dict, List
 
 import numpy as np
 
 from loopsgl.benchmark.datasets import DATASET_MAPPING, DatasetRow, get_dataset
-from loopsgl.core import SamplingParams
+from loopsgl.benchmark.utils import (
+    get_warmup_requests,
+    prepare_sampling_params,
+    replay_mean_decode_depth,
+)
 from loopsgl.env import ENV
 from loopsgl.managers.scheduler_components.config import SchedulerConfig
 from loopsgl.server_args import ServerArgs
@@ -147,13 +152,6 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def get_warmup_requests(
-    reqs: List[DatasetRow], *, num_requests: int, seed: int
-) -> List[DatasetRow]:
-    """Sample real requests without changing their contents or measured order."""
-    return random.Random(seed).sample(reqs, min(num_requests, len(reqs)))
-
-
 def throughput_test_once(
     backend_name: str,
     backend: Engine,
@@ -163,41 +161,12 @@ def throughput_test_once(
     replay_exits: bool = False,
     nvtx_label: str | None = None,
 ) -> Dict[str, Any]:
-    if not reqs:
-        raise ValueError("No requests remain after dataset filtering.")
+    sampling_params = prepare_sampling_params(
+        reqs, ignore_eos, extra_request_body, replay_exits, backend.max_seq_len
+    )
     prompt = [r.prompt for r in reqs]
-    sampling_params = []
-    for req in reqs:
-        params = {
-            "temperature": 0,
-            "max_new_tokens": req.output_len,
-            "ignore_eos": ignore_eos,
-            **extra_request_body,
-        }
-        if "max_tokens" in params:
-            raise ValueError("Use max_new_tokens in --extra-request-body, as in SGLang.")
-        params["max_tokens"] = params.pop("max_new_tokens")
-        if params["max_tokens"] <= 0:
-            raise ValueError("max_new_tokens must be positive.")
-        if req.prompt_len + params["max_tokens"] > backend.max_seq_len:
-            raise ValueError("A request exceeds the engine context length.")
-        if replay_exits:
-            params["replay_exit_depths"] = req.exit_depths
-        sampling_params.append(SamplingParams(**params))
-
-    if replay_exits:
-        if any(req.exit_depths is None for req in reqs):
-            raise ValueError("Every replay request must supply recorded exit depths.")
-        if any(
-            len(req.exit_depths) != params.max_tokens - 1
-            for req, params in zip(reqs, sampling_params)
-        ):
-            raise ValueError("Replay sampling budgets must match the recorded output lengths.")
-        if any(not params.ignore_eos or params.stop for params in sampling_params):
-            raise ValueError("Recorded exit replay requires ignore_eos and no stop sequences.")
-
     expected_output_lens = [
-        params.max_tokens if params.ignore_eos and not params.stop else None
+        params.max_new_tokens if params.ignore_eos and not params.stop else None
         for params in sampling_params
     ]
     with profile_range(nvtx_label):
@@ -221,19 +190,22 @@ def throughput_test_once(
 
     total_input_tokens = sum(r.prompt_len for r in reqs)
     total_output_tokens = sum(len(o["token_ids"]) for o in gen_out)
-    return {
+    result = {
         "backend": backend_name,
         "successful_requests": len(gen_out),
         "total_latency": latency,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "num_retracted_reqs": backend.num_retracted_reqs,
-        **backend.batch_size_metrics,
         "request_throughput": len(gen_out) / latency,
         "input_throughput": total_input_tokens / latency,
         "output_throughput": total_output_tokens / latency,
         "total_throughput": (total_input_tokens + total_output_tokens) / latency,
     }
+    timing = backend.get_server_info().get("cuda_event_timing")
+    if timing is not None:
+        result["cuda_event_timing"] = timing
+    return result
 
 
 def throughput_test(server_args: ServerArgs, bench_args: BenchArgs) -> Dict[str, Any]:
@@ -292,8 +264,15 @@ def throughput_test(server_args: ServerArgs, bench_args: BenchArgs) -> Dict[str,
             raise ValueError("No requests remain after dataset filtering.")
 
         replaying_cdb = bench_args.replay_exits and server_args.scheduler == "cdb"
-        if replaying_cdb and any(req.exit_depths is None for req in input_requests):
-            raise ValueError("Every replay request must supply recorded exit depths.")
+        mean_decode_depth = None
+        if bench_args.replay_exits:
+            # Lookahead routing completes at least two steps before a replayed CDB exit.
+            lookahead = replaying_cdb and not server_args.cdb_config.disable_lookahead_exit
+            mean_decode_depth = replay_mean_decode_depth(
+                input_requests,
+                backend.get_server_info()["loop_params"]["loop_steps"],
+                minimum=2 if lookahead else 1,
+            )
 
         if not bench_args.skip_warmup:
             logging.info("\nWarmup...")
@@ -323,6 +302,8 @@ def throughput_test(server_args: ServerArgs, bench_args: BenchArgs) -> Dict[str,
             replay_exits=replaying_cdb,
             nvtx_label="benchmark.generate",
         )
+        if mean_decode_depth is not None:
+            result["mean_decode_depth"] = mean_decode_depth
         result["config"] = {
             "enable_nvtx": bool(ENV.ENABLE_NVTX),
             "disable_overlap_scheduling": bool(ENV.DISABLE_OVERLAP_SCHEDULING),
@@ -370,7 +351,7 @@ def cli_main() -> None:
         parser.error("The offline benchmark does not support shell mode.")
     bench_args = BenchArgs.from_cli_args(args)
     server_args = ServerArgs.from_cli_args(args)
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     throughput_test(server_args, bench_args)
 
 

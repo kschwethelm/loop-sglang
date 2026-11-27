@@ -28,12 +28,15 @@ class CDBConfig:
 class SchedulerConfig(EngineConfig):
     scheduler: str | None = None
     cdb_config: CDBConfig = field(default_factory=CDBConfig)
-    max_extend_tokens: int = 8192
+    max_prefill_tokens: int = 16384
+    chunked_prefill_size: int = 8192
     min_free_slots_delay: int | None = None
     watermark: float = 0.0
     retraction_mode: str = "offload"
     retraction_cpu_memory_gb: float = 16.0
     disable_radix_cache: bool = False
+    enable_cuda_event_timing: bool = False
+    decode_log_interval: int = 40
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
@@ -56,8 +59,22 @@ class SchedulerConfig(EngineConfig):
             raise ValueError("CDB requires loop_cache_policy='shared' or 'last_exited'.")
         if self.loop_cache_policy == "last_exited" and self.page_size != 1:
             raise ValueError("Last-exited KV requires one-token pages.")
+        if self.max_prefill_tokens < 1:
+            raise ValueError("max_prefill_tokens must be positive.")
+        if isinstance(self.chunked_prefill_size, bool) or not isinstance(
+            self.chunked_prefill_size, int
+        ):
+            raise ValueError("chunked_prefill_size must be an integer.")
+        if self.cuda_graph_max_bs_prefill is None:
+            object.__setattr__(
+                self,
+                "cuda_graph_max_bs_prefill",
+                self.prefill_chunk_budget or self.max_prefill_tokens,
+            )
         if self.max_running_req < 1:
             raise ValueError("max_running_req must be positive.")
+        if self.decode_log_interval < 1:
+            raise ValueError("decode_log_interval must be positive.")
         if not 0.0 <= self.watermark < 1.0:
             raise ValueError("watermark must be in [0.0, 1.0).")
         if self.retraction_mode not in {"none", "recompute", "offload"}:
@@ -81,8 +98,13 @@ class SchedulerConfig(EngineConfig):
         return "ipc:///tmp/loopsgl_2" + self._unique_suffix
 
     @property
+    def prefill_chunk_budget(self) -> int | None:
+        size = self.chunked_prefill_size
+        return size if size > 0 else None
+
+    @property
     def max_forward_len(self) -> int:
-        return self.max_extend_tokens
+        return self.prefill_chunk_budget or max(self.max_prefill_tokens, self.max_seq_len)
 
     @property
     def zmq_frontend_addr(self) -> str:

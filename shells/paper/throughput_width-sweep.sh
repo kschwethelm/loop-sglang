@@ -3,7 +3,6 @@
 # By default compares CB, CDB-norefill, and CDB-refill.
 #
 # Maximum decode batch sizes are chosen based on saturation batch size B* for each dataset.
-# All runs are on average close to the configured maximum decode batch size.
 #
 # Widths and cache sizes for each dataset and model are defined in _common.sh.
 #
@@ -17,19 +16,25 @@ source "${REPO_ROOT:?submit with ./shells/_submit.sh}/shells/paper/_common.sh"
 MODEL="${MODEL:?set MODEL to ouro or huginn}"
 DATASET="${DATASET:?set DATASET to sharegpt, alpaca, or arxiv}"
 set_throughput_defaults
+if [[ -z "$WIDTHS" ]]; then
+    echo "No default widths for $MODEL/$DATASET with $CACHE_POLICY. Set WIDTHS explicitly to run a custom sweep." >&2
+    exit 1
+fi
 
+MODEL_ARGS=()
 case "$MODEL" in
     ouro)
         MODEL_ID="$OURO_1_4B_MODEL_ID"
         LOOP_STEPS=4
         MIN_CODA_BATCH_SIZE=1
-        THRESHOLD=0.2
+        THRESHOLD=0.0001
         ;;
     huginn)
         MODEL_ID="$HUGINN_MODEL_ID"
+        MODEL_ARGS=(--json-model-override-args "$HUGINN_MODEL_OVERRIDE_ARGS")
         LOOP_STEPS=16
         MIN_CODA_BATCH_SIZE=quarter
-        THRESHOLD=0.28
+        THRESHOLD=0.14
         ;;
     *) echo "unknown MODEL '$MODEL' (expected: ouro, huginn)" >&2; exit 1 ;;
 esac
@@ -70,9 +75,12 @@ for repeat in $(seq 0 $((REPEATS - 1))); do
             fi
             args+=(
                 --model-path "$MODEL_ID"
+                "${MODEL_ARGS[@]}"
                 --dataset-name custom --dataset-path "$WORKLOAD"
                 --custom-input-format token-ids --no-shuffle
                 --replay-exits
+                --cuda-event-timing
+                --cuda-graph-max-bs "$width"
                 --loop-steps "$LOOP_STEPS"
                 --loop-cache-policy "$policy"
                 --max-seq-len-override "$MAX_MODEL_LEN"
@@ -82,7 +90,8 @@ for repeat in $(seq 0 $((REPEATS - 1))); do
                 --attention-backend "$ATTENTION_BACKEND"
                 "${KV_CACHE_ARGS[@]}"
                 --memory-ratio "$MEMORY_RATIO"
-                --max-prefill-length "$MAX_PREFILL_LENGTH"
+                --max-prefill-tokens "$MAX_PREFILL_TOKENS"
+                --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
                 --page-size "$PAGE_SIZE"
                 "${RADIX_CACHE_ARGS[@]}"
                 --watermark "$WATERMARK"
@@ -100,7 +109,9 @@ for repeat in $(seq 0 $((REPEATS - 1))); do
                 fi
                 args+=(--min-coda-batch-size "$min_coda")
             fi
-            uv run --frozen --project "$REPO_ROOT" \
+            # Use a custom log directory for each experiment
+            log_experiment "$result_path" "w${width}_${backend}" \
+                uv run --frozen --project "$REPO_ROOT" \
                 python -u -m loopsgl.benchmark.offline_throughput "${args[@]}"
             echo ""
         done

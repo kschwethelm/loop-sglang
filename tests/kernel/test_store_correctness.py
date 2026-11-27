@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from unittest.mock import Mock
 
 import pytest
@@ -8,13 +7,8 @@ import torch
 from loopsgl.kernel import store as store_module
 from loopsgl.kernel.store import _has_supported_layout, can_use_store_cache, store_cache
 
-requires_cuda = pytest.mark.skipif(
-    not os.environ.get("SLURM_JOB_ID") or not torch.cuda.is_available(),
-    reason="CUDA KV-store checks require a SLURM allocation",
-)
 
-
-@requires_cuda
+@pytest.mark.cuda
 @pytest.mark.parametrize(
     ("k_width", "v_width", "num_split", "v_offset"),
     [
@@ -64,7 +58,7 @@ def test_store_cache_cuda(k_width: int, v_width: int, num_split: int, v_offset: 
     torch.testing.assert_close(v_storage, expected_v, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
 def test_store_cache_fallback(device: str) -> None:
     """Unsupported row layouts preserve untouched slots and accept empty batches."""
     k_storage = torch.full((9, 6), -7, device=device, dtype=torch.bfloat16)

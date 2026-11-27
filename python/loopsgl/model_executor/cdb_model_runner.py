@@ -6,6 +6,10 @@ from typing import Any, Callable, Literal
 import torch
 
 from loopsgl.core import ForwardBatch
+from loopsgl.distributed import get_tp_info
+from loopsgl.kernel import indexing
+from loopsgl.kernel.argmax import try_greedy_argmax_prelude
+from loopsgl.layers.logits_processor import LogitsProcessorOutput
 from loopsgl.models.looped.base import BaseLoopedForCausalLM
 from loopsgl.utils import profile_range
 
@@ -13,6 +17,26 @@ from .config import EngineConfig
 from .graph import _determine_cuda_graph_bs
 from .model_runner import ForwardOutput, ModelRunner
 from .sample import BatchSamplingArgs
+
+
+def _gather_state(pool: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    """Gather short contiguous CUDA state rows with the existing vector-copy kernel."""
+    # PyTorch 2.9 uses its small-index CUDA path for at most 16 rows.
+    if (
+        pool.is_cuda
+        and pool.ndim == 2
+        and pool.is_contiguous()
+        and pool.data_ptr() % 16 == 0
+        and slots.device == pool.device
+        and slots.ndim == 1
+        and slots.dtype in (torch.int32, torch.int64)
+        and slots.is_contiguous()
+        and 0 < slots.numel() <= 16
+        and pool.shape[1] > 0
+        and pool.shape[1] * pool.element_size() % 4 == 0
+    ):
+        return indexing(pool, slots)
+    return pool.index_select(0, slots)
 
 
 @dataclass
@@ -53,6 +77,7 @@ class CDBModelRunner(ModelRunner):
         self.padding_state_slots = torch.arange(
             self.padding_state_start, capacity, dtype=torch.int64, device=self.device
         )
+        self._zero_depths = torch.zeros(self.max_state_batch, dtype=torch.int32, device=self.device)
         self.copy_stream = torch.cuda.Stream(device=self.device)
         gate_slots = 3 if self.model.model.loop_params.exit_threshold is not None else 0
         self._gate_hosts = [
@@ -75,8 +100,42 @@ class CDBModelRunner(ModelRunner):
         if batch.is_decode:
             raise ValueError("CDB prefill requires an extend batch")
         with profile_range("cdb.compute.prefill"):
-            logits = self._forward_logits(batch)
-            return self.token_readback(self._sample_logits(logits[: batch.size], args))
+            if not args.needs_logprobs_or_trace:
+                logits = self._forward_logits(batch)
+                return self.token_readback(self._sample_logits(logits[: batch.size], args))
+            logits, scores = self._forward_with_logprobs(batch, args)
+            tokens = self._sample_with_trace(logits[: batch.size], args)
+            scores = self.sampler.compute_logprobs(logits[: batch.size], tokens, args, scores)
+            return self.token_readback(tokens, scores)
+
+    def _write_prelude_state(self, input_ids: torch.Tensor, slots: torch.Tensor) -> None:
+        """Initialize recurrent state for the supplied token IDs and request rows."""
+        model = self.model.model
+        hidden, injection = model.forward_prelude(input_ids)
+        self.state_pool["hidden"].index_copy_(0, slots, hidden)
+        if injection is not None:
+            self.state_pool["injection"].index_copy_(0, slots, injection)
+        if model.loop_params.exit_threshold is not None:
+            self.state_pool["exit"].index_copy_(0, slots, model.init_exit_state(hidden))
+
+    def _write_greedy_prelude(
+        self, logits: torch.Tensor, slots: torch.Tensor, tokens: torch.Tensor
+    ) -> bool:
+        """Write greedy tokens and successor state, returning whether writes were fused."""
+        embedding = self.model.model.get_fused_prelude_embedding()
+        exit_pool = self.state_pool.get("exit")
+        if (
+            embedding is not None
+            and "injection" not in self.state_pool
+            and exit_pool is not None
+            and try_greedy_argmax_prelude(
+                logits, tokens, slots, embedding, self.state_pool["hidden"], exit_pool
+            )
+        ):
+            return True
+        tokens.copy_(torch.argmax(logits, dim=-1))
+        self._write_prelude_state(tokens, slots)
+        return False
 
     def _execute_phase(
         self, phase: Literal["prelude", "core", "coda"], slots: torch.Tensor, depths: torch.Tensor
@@ -84,21 +143,16 @@ class CDBModelRunner(ModelRunner):
         assert isinstance(self.model, BaseLoopedForCausalLM)
         model = self.model.model
         if phase == "prelude":
-            hidden, injection = model.forward_prelude(self.ctx.batch.input_ids)
-            self.state_pool["hidden"].index_copy_(0, slots, hidden)
-            if injection is not None:
-                self.state_pool["injection"].index_copy_(0, slots, injection)
-            if model.loop_params.exit_threshold is not None:
-                self.state_pool["exit"].index_copy_(0, slots, model.init_exit_state(hidden))
+            self._write_prelude_state(self.ctx.batch.input_ids, slots)
             return None
-        hidden = self.state_pool["hidden"].index_select(0, slots)
+        hidden = _gather_state(self.state_pool["hidden"], slots)
         if phase == "coda":
             return self.model.forward_coda(hidden)
         injection_pool = self.state_pool.get("injection")
-        injection = None if injection_pool is None else injection_pool.index_select(0, slots)
+        injection = None if injection_pool is None else _gather_state(injection_pool, slots)
         # Read the old gate state before updating hidden, including aliasing Huginn states.
         exit_pool = self.state_pool.get("exit")
-        exit_state = None if exit_pool is None else exit_pool.index_select(0, slots)
+        exit_state = None if exit_pool is None else _gather_state(exit_pool, slots)
         hidden = model.core_step(hidden, depths, injection)
         gates = None
         if model.loop_params.exit_threshold is not None:
@@ -110,7 +164,7 @@ class CDBModelRunner(ModelRunner):
 
     def _forward_phase(
         self,
-        phase: Literal["prelude", "core", "coda"],
+        phase: Literal["prelude", "core", "coda", "coda_prelude"],
         batch: ForwardBatch,
         slots: torch.Tensor,
         depths: torch.Tensor | None = None,
@@ -118,11 +172,11 @@ class CDBModelRunner(ModelRunner):
         assert torch.cuda.current_stream() == self.stream
         if not batch.is_decode:
             raise ValueError("CDB phases require decode attention metadata")
-        slots = slots.to(device=self.device, dtype=torch.int64)
+        slots = slots.to(device=self.device)
         if slots.numel() != batch.size:
             raise ValueError("State slots must match the real phase batch size")
         if depths is None:
-            depths = torch.zeros(batch.size, dtype=torch.int32, device=self.device)
+            depths = self._zero_depths[: batch.size]
         else:
             depths = depths.to(device=self.device, dtype=torch.int32)
         if depths.numel() != batch.size:
@@ -130,6 +184,9 @@ class CDBModelRunner(ModelRunner):
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 return self.graph_runner.replay_phase(phase, batch, slots, depths)
+            if phase == "coda_prelude":
+                raise ValueError("Fused coda and prelude require a captured CUDA graph")
+            slots = slots.to(dtype=torch.int64)
             if self.model.model.phase_uses_attention(phase):
                 self.attn_backend.prepare_metadata(batch)
             batch.record_metadata_ready()
@@ -150,6 +207,41 @@ class CDBModelRunner(ModelRunner):
         logits = self._forward_phase("coda", batch, slots)
         assert logits is not None
         return self._sample_logits(logits[: batch.size], args)
+
+    def forward_coda_with_logprobs(
+        self, batch: ForwardBatch, slots: torch.Tensor, args: BatchSamplingArgs
+    ) -> tuple[torch.Tensor, LogitsProcessorOutput | None]:
+        logits = self._forward_phase("coda", batch, slots)
+        assert logits is not None
+        logits = logits[: batch.size]
+        tokens = self._sample_with_trace(logits, args)
+        return tokens, self.sampler.compute_logprobs(logits, tokens, args)
+
+    def supports_fused_boundary(self) -> bool:
+        """Require validated TP1 execution and deterministic attention-free boundaries."""
+        model = self.model.model
+        return (
+            get_tp_info().size == 1
+            and model.prelude_is_stateless
+            and not model.phase_uses_attention("prelude")
+            and not model.phase_uses_attention("coda")
+        )
+
+    def can_fuse_boundary(self, batch: ForwardBatch, args: BatchSamplingArgs) -> bool:
+        """Use the captured boundary only for greedy requests and supported model phases."""
+        return (
+            not args.needs_logprobs_or_trace
+            and args.temperatures is None
+            and self.graph_runner.can_use_cuda_graph(batch)
+            and self.supports_fused_boundary()
+        )
+
+    def forward_coda_prelude(self, batch: ForwardBatch, slots: torch.Tensor) -> torch.Tensor:
+        """Sample greedily and initialize successor state in one captured boundary."""
+        output = self._forward_phase("coda_prelude", batch, slots)
+        assert output is not None
+        # Readback can outlive the next replay's persistent token buffer.
+        return output[: batch.size].clone()
 
     def stage_gate_readback(self, gates: torch.Tensor) -> GateOutput:
         try:
@@ -181,7 +273,9 @@ class CDBModelRunner(ModelRunner):
 
         return GateOutput(host, event, release)
 
-    def token_readback(self, tokens: torch.Tensor) -> ForwardOutput:
+    def token_readback(
+        self, tokens: torch.Tensor, scores: LogitsProcessorOutput | None = None
+    ) -> ForwardOutput:
         host = torch.empty(tokens.shape, dtype=tokens.dtype, device="cpu", pin_memory=True)
         ready = torch.cuda.Event()
         ready.record(self.stream)
@@ -190,5 +284,6 @@ class CDBModelRunner(ModelRunner):
             self.copy_stream.wait_event(ready)
             host.copy_(tokens, non_blocking=True)
             tokens.record_stream(self.copy_stream)
+            host_scores = scores.copy_to_cpu() if scores is not None else None
             event.record(self.copy_stream)
-        return ForwardOutput(tokens, host, event)
+        return ForwardOutput(tokens, host, event, host_scores)

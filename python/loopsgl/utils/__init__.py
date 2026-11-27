@@ -8,7 +8,7 @@ from .hf import (
     parse_model_override_args,
 )
 from .logger import init_logger
-from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even
+from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even, set_ulimit
 from .mp import (
     ZmqAsyncPullQueue,
     ZmqAsyncPushQueue,
@@ -31,6 +31,7 @@ __all__ = [
     "parse_model_override_args",
     "init_logger",
     "get_free_port",
+    "set_ulimit",
     "is_arch_supported",
     "is_sm90_supported",
     "is_sm100_supported",

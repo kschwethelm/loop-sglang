@@ -48,7 +48,7 @@ def test_cdb_scheduling_lifecycle(
         req = Req(
             uid,
             torch.tensor([1, 3], dtype=torch.int32),
-            SamplingParams(max_tokens=4, replay_exit_depths=[2, 3, 4]),
+            SamplingParams(max_new_tokens=4, replay_exit_depths=[2, 3, 4]),
         )
         req.kv.req_pool_idx, req.device_len = uid, 3
         req.output_ids = [8]

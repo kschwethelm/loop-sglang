@@ -5,6 +5,7 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import Any, AsyncIterator, List, Literal, Tuple
 
 import uvicorn
@@ -12,11 +13,25 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.completion import WordCompleter
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from loopsgl.core import SamplingParams
 from loopsgl.env import ENV
-from loopsgl.managers.io_struct import GenerateReqInput, StrOutput
+from loopsgl.managers.io_struct import (
+    FlushCacheReqInput,
+    GenerateReqInput,
+    GetInternalStateReq,
+    StrOutput,
+)
 from loopsgl.managers.tokenizer_manager import TokenizerManager
 from loopsgl.server_args import ServerArgs
 from loopsgl.stopping import normalize_stops
@@ -53,10 +68,22 @@ class StopRequest(BaseModel):
         return normalize_stops(value)
 
 
-class GenerateRequest(StopRequest):
-    prompt: str
-    max_tokens: int
-    ignore_eos: bool = False
+class GenerateRequest(BaseModel):
+    """Supported single-request SGLang native generation input."""
+
+    model_config = ConfigDict(extra="forbid")
+    text: StrictStr | None = None
+    input_ids: list[StrictInt] | None = None
+    sampling_params: dict[str, Any] = Field(default_factory=dict)
+    stream: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_input(self) -> GenerateRequest:
+        if (self.text is None) == (self.input_ids is None):
+            raise ValueError("Specify exactly one of text and input_ids.")
+        if self.text == "":
+            raise ValueError("Text prompts must be nonempty.")
+        return self
 
 
 class Message(BaseModel):
@@ -99,13 +126,32 @@ class ModelList(BaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
-async def stream_generate(state: TokenizerManager, uid: int) -> AsyncIterator[bytes]:
-    async for ack in state._wait_one_response(uid):
-        yield f"data: {ack.incremental_output}\n".encode()
-        if ack.finished:
-            break
-    yield "data: [DONE]\n".encode()
-    logger.debug("Finished streaming response for user %s", uid)
+async def stream_generate(
+    state: TokenizerManager, uid: int, request: Request
+) -> AsyncIterator[bytes]:
+    prompt_tokens = state.rid_to_state[uid].prompt_tokens
+    text = ""
+    responses = state._wait_one_response(uid, request=request)
+    try:
+        async for ack in responses:
+            text += ack.incremental_output
+            if ack.finished and ack.text is not None:
+                text = ack.text
+            result = {
+                "text": text,
+                "meta_info": {
+                    "id": str(uid),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": ack.completion_tokens,
+                    "finish_reason": ack.finish_reason,
+                },
+            }
+            yield ("data: " + json.dumps(result, ensure_ascii=False) + "\n\n").encode()
+        yield b"data: [DONE]\n\n"
+    except Exception as exc:
+        yield ("data: " + json.dumps({"error": {"message": str(exc)}}) + "\n\n").encode()
+    finally:
+        await responses.aclose()
 
 
 async def stream_chat_completions(state: TokenizerManager, uid: int) -> AsyncIterator[bytes]:
@@ -172,28 +218,73 @@ async def validation_exception_handler(request: Request, exc: ValueError) -> JSO
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
-@app.post("/generate")
-async def generate(req: GenerateRequest, request: Request):
-    logger.debug("Received generate request %s", req)
+@app.post("/generate", response_model=None)
+async def generate(req: GenerateRequest, request: Request) -> JSONResponse | StreamingResponse:
     state = get_global_state()
+    if req.input_ids is not None and any(
+        token < 0 or token >= state.server_args.model_config.vocab_size for token in req.input_ids
+    ):
+        raise ValueError("input_ids must contain token IDs within the model vocabulary.")
+    try:
+        params = SamplingParams(**req.sampling_params)
+    except TypeError as exc:
+        raise ValueError(f"Unsupported sampling parameters: {exc}") from exc
     uid = state.new_request()
     await state.send_request(
-        GenerateReqInput(
-            uid=uid,
-            text=req.prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                stop=req.stop,
-                no_stop_trim=req.no_stop_trim,
-            ),
+        GenerateReqInput(uid=uid, text=req.text, input_ids=req.input_ids, sampling_params=params)
+    )
+    if req.stream:
+        return StreamingResponse(
+            stream_with_cancellation(state, stream_generate(state, uid, request), request, uid),
+            media_type="text/event-stream",
         )
-    )
 
-    return StreamingResponse(
-        stream_with_cancellation(state, stream_generate(state, uid), request, uid),
-        media_type="text/event-stream",
-    )
+    prompt_tokens = state.rid_to_state[uid].prompt_tokens
+    responses = state._wait_one_response(uid, request=request)
+    try:
+        async for ack in responses:
+            if ack.finished:
+                return JSONResponse(
+                    {
+                        "text": ack.text or "",
+                        "meta_info": {
+                            "id": str(uid),
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": ack.completion_tokens,
+                            "finish_reason": ack.finish_reason,
+                        },
+                    }
+                )
+    finally:
+        await responses.aclose()
+    raise RuntimeError("Generation ended without a completed response.")
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    state = get_global_state()
+    try:
+        state._raise_if_unavailable()
+    except RuntimeError as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/server_info")
+async def server_info() -> JSONResponse:
+    state = get_global_state()
+    info = await state.scheduler_request(GetInternalStateReq)
+    server_args = {
+        key: value for key, value in asdict(state.server_args).items() if not key.startswith("_")
+    }
+    server_args["dtype"] = str(state.server_args.dtype)
+    return JSONResponse({**info, "server_args": server_args})
+
+
+@app.post("/flush_cache")
+async def flush_cache() -> JSONResponse:
+    info = await get_global_state().scheduler_request(FlushCacheReqInput)
+    return JSONResponse(info)
 
 
 @app.api_route("/v1", methods=["GET", "POST", "HEAD", "OPTIONS"])
@@ -219,7 +310,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             chat_template_kwargs=req.chat_template_kwargs,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
+                max_new_tokens=req.max_tokens,
                 temperature=req.temperature,
                 top_k=req.top_k,
                 top_p=req.top_p,
@@ -285,7 +376,7 @@ async def shell_completion(req: OpenAICompletionRequest) -> AsyncIterator[StrOut
             chat_template_kwargs=req.chat_template_kwargs,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
+                max_new_tokens=req.max_tokens,
                 temperature=req.temperature,
                 top_k=req.top_k,
                 top_p=req.top_p,
@@ -307,7 +398,7 @@ async def shell_completion(req: OpenAICompletionRequest) -> AsyncIterator[StrOut
 
 
 async def shell() -> None:
-    commands = ["/exit", "/reset", "/colors"]
+    commands = ["/exit", "/clear", "/colors"]
     completer = WordCompleter(commands)
     session = PromptSession("$ ", completer=completer)
     colors_enabled = "NO_COLOR" not in os.environ
@@ -325,7 +416,7 @@ async def shell() -> None:
             if cmd.startswith("/"):
                 if cmd == "/exit":
                     return
-                if cmd == "/reset":
+                if cmd == "/clear":
                     history = []
                     continue
                 if cmd == "/colors":
@@ -335,7 +426,8 @@ async def shell() -> None:
                     else:
                         print("Loop-step colors disabled.")
                     continue
-                raise ValueError(f"Unknown command: {cmd}")
+                print(f"Unknown command: {cmd}. Available commands: {', '.join(commands)}")
+                continue
             history_messages: List[Message] = []
             for user_msg, assistant_msg in history:
                 history_messages.append(Message(role="user", content=user_msg))
